@@ -12,7 +12,7 @@ use mime;
 use mime_guess::guess_mime_type;
 
 use actix_http::error::Error;
-use actix_http::http::header::{self, ContentDisposition, DispositionParam};
+use actix_http::http::header::{self, ContentDisposition, DispositionParam, CONTENT_ENCODING};
 use actix_web::http::{ContentEncoding, Method, StatusCode};
 use actix_web::{HttpMessage, HttpRequest, HttpResponse, Responder};
 
@@ -311,10 +311,12 @@ impl<C: StaticFileConfig> Responder for NamedFile<C> {
                     header::CONTENT_DISPOSITION,
                     self.content_disposition.to_string(),
                 );
-            // TODO blocking by compressing
-            // if let Some(current_encoding) = self.encoding {
-            //     resp.content_encoding(current_encoding);
-            // }
+
+            // if file encoding has been set, propagate to response header
+            if let Some(current_encoding) = self.encoding {
+                resp.set_header(CONTENT_ENCODING, current_encoding.as_str());
+            }
+
             let reader = ChunkedReadFile {
                 size: self.md.len(),
                 offset: 0,
@@ -369,10 +371,11 @@ impl<C: StaticFileConfig> Responder for NamedFile<C> {
                 header::CONTENT_DISPOSITION,
                 self.content_disposition.to_string(),
             );
-        // TODO blocking by compressing
-        // if let Some(current_encoding) = self.encoding {
-        //     resp.content_encoding(current_encoding);
-        // }
+
+        // if file encoding has been set, propagate to response header
+        if let Some(current_encoding) = self.encoding {
+            resp.set_header(CONTENT_ENCODING, current_encoding.as_str());
+        }
 
         resp.if_some(last_modified, |lm, resp| {
             resp.set(header::LastModified(lm));
@@ -392,8 +395,12 @@ impl<C: StaticFileConfig> Responder for NamedFile<C> {
                 if let Ok(rangesvec) = HttpRange::parse(rangesheader, length) {
                     length = rangesvec[0].length;
                     offset = rangesvec[0].start;
-                    // TODO blocking by compressing
-                    // resp.content_encoding(ContentEncoding::Identity);
+
+                    // if file encoding has been set, propagate to response header
+                    if let Some(current_encoding) = self.encoding {
+                        resp.set_header(CONTENT_ENCODING, current_encoding.as_str());
+                    }
+
                     resp.header(
                         header::CONTENT_RANGE,
                         format!(
