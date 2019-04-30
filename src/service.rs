@@ -1,83 +1,74 @@
 use std::cell::{Ref, RefMut};
-use std::fmt;
-use std::marker::PhantomData;
-use std::rc::Rc;
+use std::{fmt, net};
 
 use actix_http::body::{Body, MessageBody, ResponseBody};
-use actix_http::http::{HeaderMap, Method, Uri, Version};
+use actix_http::http::{HeaderMap, Method, StatusCode, Uri, Version};
 use actix_http::{
-    Error, Extensions, HttpMessage, Payload, PayloadStream, Request, RequestHead,
-    Response, ResponseHead,
+    Error, Extensions, HttpMessage, Payload, PayloadStream, RequestHead, Response,
+    ResponseHead,
 };
-use actix_router::{Path, Resource, Url};
+use actix_router::{Path, Resource, ResourceDef, Url};
+use actix_service::{IntoNewService, NewService};
 use futures::future::{ok, FutureResult, IntoFuture};
 
-use crate::config::{AppConfig, ServiceConfig};
-use crate::data::RouteData;
+use crate::config::{AppConfig, AppService};
+use crate::data::Data;
+use crate::dev::insert_slash;
+use crate::guard::Guard;
+use crate::info::ConnectionInfo;
 use crate::request::HttpRequest;
-use crate::rmap::ResourceMap;
 
-pub trait HttpServiceFactory<P> {
-    fn register(self, config: &mut ServiceConfig<P>);
+pub trait HttpServiceFactory {
+    fn register(self, config: &mut AppService);
 }
 
-pub(crate) trait ServiceFactory<P> {
-    fn register(&mut self, config: &mut ServiceConfig<P>);
+pub(crate) trait ServiceFactory {
+    fn register(&mut self, config: &mut AppService);
 }
 
-pub(crate) struct ServiceFactoryWrapper<T, P> {
+pub(crate) struct ServiceFactoryWrapper<T> {
     factory: Option<T>,
-    _t: PhantomData<P>,
 }
 
-impl<T, P> ServiceFactoryWrapper<T, P> {
+impl<T> ServiceFactoryWrapper<T> {
     pub fn new(factory: T) -> Self {
         Self {
             factory: Some(factory),
-            _t: PhantomData,
         }
     }
 }
 
-impl<T, P> ServiceFactory<P> for ServiceFactoryWrapper<T, P>
+impl<T> ServiceFactory for ServiceFactoryWrapper<T>
 where
-    T: HttpServiceFactory<P>,
+    T: HttpServiceFactory,
 {
-    fn register(&mut self, config: &mut ServiceConfig<P>) {
+    fn register(&mut self, config: &mut AppService) {
         if let Some(item) = self.factory.take() {
             item.register(config)
         }
     }
 }
 
-pub struct ServiceRequest<P = PayloadStream> {
+pub struct ServiceRequest {
     req: HttpRequest,
-    payload: Payload<P>,
+    payload: Payload,
 }
 
-impl<P> ServiceRequest<P> {
-    pub(crate) fn new(
-        path: Path<Url>,
-        request: Request<P>,
-        rmap: Rc<ResourceMap>,
-        config: AppConfig,
-    ) -> Self {
-        let (head, payload) = request.into_parts();
-        ServiceRequest {
-            payload,
-            req: HttpRequest::new(head, path, rmap, config),
-        }
+impl ServiceRequest {
+    /// Construct service request from parts
+    pub(crate) fn from_parts(req: HttpRequest, payload: Payload) -> Self {
+        ServiceRequest { req, payload }
     }
 
-    #[inline]
-    pub fn into_request(self) -> HttpRequest {
-        self.req
+    /// Deconstruct request into parts
+    pub fn into_parts(self) -> (HttpRequest, Payload) {
+        (self.req, self.payload)
     }
 
     /// Create service response
     #[inline]
-    pub fn into_response<B>(self, res: Response<B>) -> ServiceResponse<B> {
-        ServiceResponse::new(self.req, res)
+    pub fn into_response<B, R: Into<Response<B>>>(self, res: R) -> ServiceResponse<B> {
+        ServiceResponse::new(self.req, res.into())
     }
 
     /// Create service response for error
@@ -90,13 +81,13 @@ impl<P> ServiceRequest<P> {
     /// This method returns reference to the request head
     #[inline]
     pub fn head(&self) -> &RequestHead {
-        &self.req.head
+        &self.req.head()
     }
 
     /// This method returns reference to the request head
     #[inline]
     pub fn head_mut(&mut self) -> &mut RequestHead {
-        &mut self.req.head
+        self.req.head_mut()
     }
 
     /// Request's uri.
@@ -118,7 +109,13 @@ impl<P> ServiceRequest<P> {
     }
 
     #[inline]
-    /// Returns mutable Request's headers.
+    /// Returns request's headers.
+    pub fn headers(&self) -> &HeaderMap {
+        &self.head().headers
+    }
+
+    #[inline]
+    /// Returns mutable request's headers.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.head_mut().headers
     }
@@ -141,6 +138,23 @@ impl<P> ServiceRequest<P> {
         }
     }
 
+    /// Peer socket address
+    ///
+    /// Peer address is actual socket address, if proxy is used in front of
+    /// actix http server, then peer address would be address of this proxy.
+    ///
+    /// To get client connection information `ConnectionInfo` should be used.
+    #[inline]
+    pub fn peer_addr(&self) -> Option<net::SocketAddr> {
+        self.head().peer_addr
+    }
+
+    /// Get *ConnectionInfo* for the current request.
+    #[inline]
+    pub fn connection_info(&self) -> Ref<ConnectionInfo> {
+        ConnectionInfo::get(self.head(), &*self.app_config())
+    }
+
     /// Get a reference to the Path parameters.
     ///
     /// Params is a container for url parameters.
@@ -149,34 +163,39 @@ impl<P> ServiceRequest<P> {
     /// access the matched value for that segment.
     #[inline]
     pub fn match_info(&self) -> &Path<Url> {
-        &self.req.path
+        self.req.match_info()
     }
 
     #[inline]
     pub fn match_info_mut(&mut self) -> &mut Path<Url> {
-        &mut self.req.path
+        self.req.match_info_mut()
     }
 
     /// Service configuration
     #[inline]
     pub fn app_config(&self) -> &AppConfig {
-        self.req.config()
+        self.req.app_config()
     }
 
-    /// Deconstruct request into parts
-    pub fn into_parts(self) -> (HttpRequest, Payload<P>) {
-        (self.req, self.payload)
+    /// Get an application data stored with `App::data()` method during
+    /// application configuration.
+    pub fn app_data<T: 'static>(&self) -> Option<Data<T>> {
+        if let Some(st) = self.req.app_config().extensions().get::<Data<T>>() {
+            Some(st.clone())
+        } else {
+            None
+        }
     }
 }
 
-impl<P> Resource<Url> for ServiceRequest<P> {
+impl Resource<Url> for ServiceRequest {
     fn resource_path(&mut self) -> &mut Path<Url> {
         self.match_info_mut()
     }
 }
 
-impl<P> HttpMessage for ServiceRequest<P> {
-    type Stream = P;
+impl HttpMessage for ServiceRequest {
+    type Stream = PayloadStream;
 
     #[inline]
     /// Returns Request's headers.
@@ -187,13 +206,13 @@ impl<P> HttpMessage for ServiceRequest<P> {
     /// Request extensions
     #[inline]
     fn extensions(&self) -> Ref<Extensions> {
-        self.req.head.extensions()
+        self.req.extensions()
     }
 
     /// Mutable reference to a the request's extensions
     #[inline]
     fn extensions_mut(&self) -> RefMut<Extensions> {
-        self.req.head.extensions_mut()
+        self.req.extensions_mut()
     }
 
     #[inline]
@@ -202,21 +221,7 @@ impl<P> HttpMessage for ServiceRequest<P> {
     }
 }
 
-impl<P> std::ops::Deref for ServiceRequest<P> {
-    type Target = RequestHead;
-
-    fn deref(&self) -> &RequestHead {
-        self.req.head()
-    }
-}
-
-impl<P> std::ops::DerefMut for ServiceRequest<P> {
-    fn deref_mut(&mut self) -> &mut RequestHead {
-        self.head_mut()
-    }
-}
-
-impl<P> fmt::Debug for ServiceRequest<P> {
+impl fmt::Debug for ServiceRequest {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(
             f,
@@ -236,82 +241,6 @@ impl<P> fmt::Debug for ServiceRequest<P> {
             writeln!(f, "    {:?}: {:?}", key, val)?;
         }
         Ok(())
-    }
-}
-
-pub struct ServiceFromRequest<P> {
-    req: HttpRequest,
-    payload: Payload<P>,
-    data: Option<Rc<Extensions>>,
-}
-
-impl<P> ServiceFromRequest<P> {
-    pub(crate) fn new(req: ServiceRequest<P>, data: Option<Rc<Extensions>>) -> Self {
-        Self {
-            req: req.req,
-            payload: req.payload,
-            data,
-        }
-    }
-
-    #[inline]
-    pub fn into_request(self) -> HttpRequest {
-        self.req
-    }
-
-    #[inline]
-    pub fn match_info_mut(&mut self) -> &mut Path<Url> {
-        &mut self.req.path
-    }
-
-    /// Create service response for error
-    #[inline]
-    pub fn error_response<E: Into<Error>>(self, err: E) -> ServiceResponse {
-        ServiceResponse::new(self.req, err.into().into())
-    }
-
-    /// Load route data. Route data could be set during
-    /// route configuration with `Route::data()` method.
-    pub fn route_data<T: 'static>(&self) -> Option<&RouteData<T>> {
-        if let Some(ref ext) = self.data {
-            ext.get::<RouteData<T>>()
-        } else {
-            None
-        }
-    }
-}
-
-impl<P> std::ops::Deref for ServiceFromRequest<P> {
-    type Target = HttpRequest;
-
-    fn deref(&self) -> &HttpRequest {
-        &self.req
-    }
-}
-
-impl<P> HttpMessage for ServiceFromRequest<P> {
-    type Stream = P;
-
-    #[inline]
-    fn headers(&self) -> &HeaderMap {
-        self.req.headers()
-    }
-
-    /// Request extensions
-    #[inline]
-    fn extensions(&self) -> Ref<Extensions> {
-        self.req.head.extensions()
-    }
-
-    /// Mutable reference to a the request's extensions
-    #[inline]
-    fn extensions_mut(&self) -> RefMut<Extensions> {
-        self.req.head.extensions_mut()
-    }
-
-    #[inline]
-    fn take_payload(&mut self) -> Payload<Self::Stream> {
-        std::mem::replace(&mut self.payload, Payload::None)
     }
 }
 
@@ -366,6 +295,24 @@ impl<B> ServiceResponse<B> {
         &mut self.response
     }
 
+    /// Get the response status code
+    #[inline]
+    pub fn status(&self) -> StatusCode {
+        self.response.status()
+    }
+
+    #[inline]
+    /// Returns response's headers.
+    pub fn headers(&self) -> &HeaderMap {
+        self.response.headers()
+    }
+
+    #[inline]
+    /// Returns mutable response's headers.
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        self.response.headers_mut()
+    }
+
     /// Execute closure and in case of error convert it to response.
     pub fn checked_expr<F, E>(mut self, f: F) -> Self
     where
@@ -402,20 +349,6 @@ impl<B> ServiceResponse<B> {
     }
 }
 
-impl<B> std::ops::Deref for ServiceResponse<B> {
-    type Target = Response<B>;
-
-    fn deref(&self) -> &Response<B> {
-        self.response()
-    }
-}
-
-impl<B> std::ops::DerefMut for ServiceResponse<B> {
-    fn deref_mut(&mut self) -> &mut Response<B> {
-        self.response_mut()
-    }
-}
-
 impl<B> Into<Response<B>> for ServiceResponse<B> {
     fn into(self) -> Response<B> {
         self.response
@@ -445,7 +378,160 @@ impl<B: MessageBody> fmt::Debug for ServiceResponse<B> {
         for (key, val) in self.response.head().headers.iter() {
             let _ = writeln!(f, "    {:?}: {:?}", key, val);
         }
-        let _ = writeln!(f, "  body: {:?}", self.response.body().length());
+        let _ = writeln!(f, "  body: {:?}", self.response.body().size());
         res
+    }
+}
+
+pub struct WebService {
+    rdef: String,
+    name: Option<String>,
+    guards: Vec<Box<Guard>>,
+}
+
+impl WebService {
+    /// Create new `WebService` instance.
+    pub fn new(path: &str) -> Self {
+        WebService {
+            rdef: path.to_string(),
+            name: None,
+            guards: Vec::new(),
+        }
+    }
+
+    /// Set service name.
+    ///
+    /// Name is used for url generation.
+    pub fn name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
+    }
+
+    /// Add match guard to a web service.
+    ///
+    /// ```rust
+    /// use actix_web::{web, guard, dev, App, HttpResponse};
+    ///
+    /// fn index(req: dev::ServiceRequest) -> dev::ServiceResponse {
+    ///     req.into_response(HttpResponse::Ok().finish())
+    /// }
+    ///
+    /// fn main() {
+    ///     let app = App::new()
+    ///         .service(
+    ///             web::service("/app")
+    ///                 .guard(guard::Header("content-type", "text/plain"))
+    ///                 .finish(index)
+    ///         );
+    /// }
+    /// ```
+    pub fn guard<G: Guard + 'static>(mut self, guard: G) -> Self {
+        self.guards.push(Box::new(guard));
+        self
+    }
+
+    /// Set a service factory implementation and generate web service.
+    pub fn finish<T, F>(self, service: F) -> impl HttpServiceFactory
+    where
+        F: IntoNewService<T>,
+        T: NewService<
+                Request = ServiceRequest,
+                Response = ServiceResponse,
+                Error = Error,
+                InitError = (),
+            > + 'static,
+    {
+        WebServiceImpl {
+            srv: service.into_new_service(),
+            rdef: self.rdef,
+            name: self.name,
+            guards: self.guards,
+        }
+    }
+}
+
+struct WebServiceImpl<T> {
+    srv: T,
+    rdef: String,
+    name: Option<String>,
+    guards: Vec<Box<Guard>>,
+}
+
+impl<T> HttpServiceFactory for WebServiceImpl<T>
+where
+    T: NewService<
+            Request = ServiceRequest,
+            Response = ServiceResponse,
+            Error = Error,
+            InitError = (),
+        > + 'static,
+{
+    fn register(mut self, config: &mut AppService) {
+        let guards = if self.guards.is_empty() {
+            None
+        } else {
+            Some(std::mem::replace(&mut self.guards, Vec::new()))
+        };
+
+        let mut rdef = if config.is_root() || !self.rdef.is_empty() {
+            ResourceDef::new(&insert_slash(&self.rdef))
+        } else {
+            ResourceDef::new(&self.rdef)
+        };
+        if let Some(ref name) = self.name {
+            *rdef.name_mut() = name.clone();
+        }
+        config.register_service(rdef, guards, self.srv, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::{call_service, init_service, TestRequest};
+    use crate::{guard, http, web, App, HttpResponse};
+
+    #[test]
+    fn test_service() {
+        let mut srv = init_service(
+            App::new().service(web::service("/test").name("test").finish(
+                |req: ServiceRequest| req.into_response(HttpResponse::Ok().finish()),
+            )),
+        );
+        let req = TestRequest::with_uri("/test").to_request();
+        let resp = call_service(&mut srv, req);
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let mut srv = init_service(
+            App::new().service(web::service("/test").guard(guard::Get()).finish(
+                |req: ServiceRequest| req.into_response(HttpResponse::Ok().finish()),
+            )),
+        );
+        let req = TestRequest::with_uri("/test")
+            .method(http::Method::PUT)
+            .to_request();
+        let resp = call_service(&mut srv, req);
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_fmt_debug() {
+        let req = TestRequest::get()
+            .uri("/index.html?test=1")
+            .header("x-test", "111")
+            .to_srv_request();
+        let s = format!("{:?}", req);
+        assert!(s.contains("ServiceRequest"));
+        assert!(s.contains("test=1"));
+        assert!(s.contains("x-test"));
+
+        let res = HttpResponse::Ok().header("x-test", "111").finish();
+        let res = TestRequest::post()
+            .uri("/index.html?test=1")
+            .to_srv_response(res);
+
+        let s = format!("{:?}", res);
+        assert!(s.contains("ServiceResponse"));
+        assert!(s.contains("x-test"));
     }
 }

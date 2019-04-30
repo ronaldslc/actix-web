@@ -19,7 +19,7 @@
 //!     App::new().service(web::resource("/index.html").route(
 //!         web::route()
 //!              .guard(guard::Post())
-//!              .guard(|head: &dev::RequestHead| head.method == http::Method::GET)
+//!              .guard(guard::fn_guard(|head| head.method == http::Method::GET))
 //!              .to(|| HttpResponse::MethodNotAllowed()))
 //!     );
 //! }
@@ -39,15 +39,46 @@ pub trait Guard {
     fn check(&self, request: &RequestHead) -> bool;
 }
 
-#[doc(hidden)]
-pub struct FnGuard<F: Fn(&RequestHead) -> bool + 'static>(F);
+/// Create guard object for supplied function.
+///
+/// ```rust
+/// use actix_web::{guard, web, App, HttpResponse};
+///
+/// fn main() {
+///     App::new().service(web::resource("/index.html").route(
+///         web::route()
+///             .guard(
+///                 guard::fn_guard(
+///                     |req| req.headers()
+///                              .contains_key("content-type")))
+///             .to(|| HttpResponse::MethodNotAllowed()))
+///     );
+/// }
+/// ```
+pub fn fn_guard<F>(f: F) -> impl Guard
+where
+    F: Fn(&RequestHead) -> bool,
+{
+    FnGuard(f)
+}
+
+struct FnGuard<F: Fn(&RequestHead) -> bool>(F);
+
+impl<F> Guard for FnGuard<F>
+where
+    F: Fn(&RequestHead) -> bool,
+{
+    fn check(&self, head: &RequestHead) -> bool {
+        (self.0)(head)
+    }
+}
 
 impl<F> Guard for F
 where
-    F: Fn(&RequestHead) -> bool + 'static,
+    F: Fn(&RequestHead) -> bool,
 {
     fn check(&self, head: &RequestHead) -> bool {
-        (*self)(head)
+        (self)(head)
     }
 }
 
@@ -93,7 +124,6 @@ impl Guard for AnyGuard {
 /// Return guard that matches if all of the supplied guards.
 ///
 /// ```rust
-/// # extern crate actix_web;
 /// use actix_web::{guard, web, App, HttpResponse};
 ///
 /// fn main() {
@@ -279,13 +309,13 @@ mod tests {
             .to_http_request();
 
         let pred = Header("transfer-encoding", "chunked");
-        assert!(pred.check(&req));
+        assert!(pred.check(req.head()));
 
         let pred = Header("transfer-encoding", "other");
-        assert!(!pred.check(&req));
+        assert!(!pred.check(req.head()));
 
         let pred = Header("content-type", "other");
-        assert!(!pred.check(&req));
+        assert!(!pred.check(req.head()));
     }
 
     // #[test]
@@ -311,50 +341,50 @@ mod tests {
             .method(Method::POST)
             .to_http_request();
 
-        assert!(Get().check(&req));
-        assert!(!Get().check(&req2));
-        assert!(Post().check(&req2));
-        assert!(!Post().check(&req));
+        assert!(Get().check(req.head()));
+        assert!(!Get().check(req2.head()));
+        assert!(Post().check(req2.head()));
+        assert!(!Post().check(req.head()));
 
         let r = TestRequest::default().method(Method::PUT).to_http_request();
-        assert!(Put().check(&r));
-        assert!(!Put().check(&req));
+        assert!(Put().check(r.head()));
+        assert!(!Put().check(req.head()));
 
         let r = TestRequest::default()
             .method(Method::DELETE)
             .to_http_request();
-        assert!(Delete().check(&r));
-        assert!(!Delete().check(&req));
+        assert!(Delete().check(r.head()));
+        assert!(!Delete().check(req.head()));
 
         let r = TestRequest::default()
             .method(Method::HEAD)
             .to_http_request();
-        assert!(Head().check(&r));
-        assert!(!Head().check(&req));
+        assert!(Head().check(r.head()));
+        assert!(!Head().check(req.head()));
 
         let r = TestRequest::default()
             .method(Method::OPTIONS)
             .to_http_request();
-        assert!(Options().check(&r));
-        assert!(!Options().check(&req));
+        assert!(Options().check(r.head()));
+        assert!(!Options().check(req.head()));
 
         let r = TestRequest::default()
             .method(Method::CONNECT)
             .to_http_request();
-        assert!(Connect().check(&r));
-        assert!(!Connect().check(&req));
+        assert!(Connect().check(r.head()));
+        assert!(!Connect().check(req.head()));
 
         let r = TestRequest::default()
             .method(Method::PATCH)
             .to_http_request();
-        assert!(Patch().check(&r));
-        assert!(!Patch().check(&req));
+        assert!(Patch().check(r.head()));
+        assert!(!Patch().check(req.head()));
 
         let r = TestRequest::default()
             .method(Method::TRACE)
             .to_http_request();
-        assert!(Trace().check(&r));
-        assert!(!Trace().check(&req));
+        assert!(Trace().check(r.head()));
+        assert!(!Trace().check(req.head()));
     }
 
     #[test]
@@ -363,13 +393,13 @@ mod tests {
             .method(Method::TRACE)
             .to_http_request();
 
-        assert!(Not(Get()).check(&r));
-        assert!(!Not(Trace()).check(&r));
+        assert!(Not(Get()).check(r.head()));
+        assert!(!Not(Trace()).check(r.head()));
 
-        assert!(All(Trace()).and(Trace()).check(&r));
-        assert!(!All(Get()).and(Trace()).check(&r));
+        assert!(All(Trace()).and(Trace()).check(r.head()));
+        assert!(!All(Get()).and(Trace()).check(r.head()));
 
-        assert!(Any(Get()).or(Trace()).check(&r));
-        assert!(!Any(Get()).or(Get()).check(&r));
+        assert!(Any(Get()).or(Trace()).check(r.head()));
+        assert!(!Any(Get()).or(Get()).check(r.head()));
     }
 }

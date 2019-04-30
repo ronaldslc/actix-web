@@ -8,6 +8,7 @@ use futures::{Future, Poll};
 use crate::http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use crate::http::{HeaderMap, HttpTryFrom};
 use crate::service::{ServiceRequest, ServiceResponse};
+use crate::Error;
 
 /// `Middleware` for setting default response headers.
 ///
@@ -18,7 +19,7 @@ use crate::service::{ServiceRequest, ServiceResponse};
 ///
 /// fn main() {
 ///     let app = App::new()
-///         .middleware(middleware::DefaultHeaders::new().header("X-Version", "0.2"))
+///         .wrap(middleware::DefaultHeaders::new().header("X-Version", "0.2"))
 ///         .service(
 ///             web::resource("/test")
 ///                 .route(web::get().to(|| HttpResponse::Ok()))
@@ -85,14 +86,14 @@ impl DefaultHeaders {
     }
 }
 
-impl<S, P, B> Transform<S> for DefaultHeaders
+impl<S, B> Transform<S> for DefaultHeaders
 where
-    S: Service<Request = ServiceRequest<P>, Response = ServiceResponse<B>>,
+    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     S::Future: 'static,
 {
-    type Request = ServiceRequest<P>;
+    type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
-    type Error = S::Error;
+    type Error = Error;
     type InitError = ();
     type Transform = DefaultHeadersMiddleware<S>;
     type Future = FutureResult<Self::Transform, Self::InitError>;
@@ -110,32 +111,32 @@ pub struct DefaultHeadersMiddleware<S> {
     inner: Rc<Inner>,
 }
 
-impl<S, P, B> Service for DefaultHeadersMiddleware<S>
+impl<S, B> Service for DefaultHeadersMiddleware<S>
 where
-    S: Service<Request = ServiceRequest<P>, Response = ServiceResponse<B>>,
+    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     S::Future: 'static,
 {
-    type Request = ServiceRequest<P>;
+    type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
-    type Error = S::Error;
+    type Error = Error;
     type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
         self.service.poll_ready()
     }
 
-    fn call(&mut self, req: ServiceRequest<P>) -> Self::Future {
+    fn call(&mut self, req: ServiceRequest) -> Self::Future {
         let inner = self.inner.clone();
 
         Box::new(self.service.call(req).map(move |mut res| {
             // set response headers
             for (key, value) in inner.headers.iter() {
                 if !res.headers().contains_key(key) {
-                    res.headers_mut().insert(key, value.clone());
+                    res.headers_mut().insert(key.clone(), value.clone());
                 }
             }
             // default content-type
-            if inner.ct && !res.headers().contains_key(CONTENT_TYPE) {
+            if inner.ct && !res.headers().contains_key(&CONTENT_TYPE) {
                 res.headers_mut().insert(
                     CONTENT_TYPE,
                     HeaderValue::from_static("application/octet-stream"),
@@ -154,27 +155,24 @@ mod tests {
     use super::*;
     use crate::dev::ServiceRequest;
     use crate::http::header::CONTENT_TYPE;
-    use crate::test::{block_on, TestRequest};
+    use crate::test::{block_on, ok_service, TestRequest};
     use crate::HttpResponse;
 
     #[test]
     fn test_default_headers() {
-        let srv = FnService::new(|req: ServiceRequest<_>| {
-            req.into_response(HttpResponse::Ok().finish())
-        });
         let mut mw = block_on(
             DefaultHeaders::new()
                 .header(CONTENT_TYPE, "0001")
-                .new_transform(srv),
+                .new_transform(ok_service()),
         )
         .unwrap();
 
-        let req = TestRequest::default().to_service();
+        let req = TestRequest::default().to_srv_request();
         let resp = block_on(mw.call(req)).unwrap();
         assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "0001");
 
-        let req = TestRequest::default().to_service();
-        let srv = FnService::new(|req: ServiceRequest<_>| {
+        let req = TestRequest::default().to_srv_request();
+        let srv = FnService::new(|req: ServiceRequest| {
             req.into_response(HttpResponse::Ok().header(CONTENT_TYPE, "0002").finish())
         });
         let mut mw = block_on(
@@ -189,13 +187,13 @@ mod tests {
 
     #[test]
     fn test_content_type() {
-        let srv = FnService::new(|req: ServiceRequest<_>| {
+        let srv = FnService::new(|req: ServiceRequest| {
             req.into_response(HttpResponse::Ok().finish())
         });
         let mut mw =
             block_on(DefaultHeaders::new().content_type().new_transform(srv)).unwrap();
 
-        let req = TestRequest::default().to_service();
+        let req = TestRequest::default().to_srv_request();
         let resp = block_on(mw.call(req)).unwrap();
         assert_eq!(
             resp.headers().get(CONTENT_TYPE).unwrap(),

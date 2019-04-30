@@ -31,7 +31,7 @@
 //! fn main() -> std::io::Result<()> {
 //! # std::thread::spawn(||
 //!     HttpServer::new(
-//!         || App::new().middleware(
+//!         || App::new().wrap(
 //!               CookieSession::signed(&[0; 32]) // <- create cookie based session middleware
 //!                     .secure(false)
 //!              )
@@ -45,8 +45,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use actix_web::dev::{ServiceFromRequest, ServiceRequest, ServiceResponse};
-use actix_web::{Error, FromRequest, HttpMessage};
+use actix_web::dev::{Extensions, Payload, ServiceRequest, ServiceResponse};
+use actix_web::{Error, FromRequest, HttpMessage, HttpRequest};
 use hashbrown::HashMap;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -78,6 +78,23 @@ pub use crate::cookie::CookieSession;
 /// # fn main() {}
 /// ```
 pub struct Session(Rc<RefCell<SessionInner>>);
+
+/// Helper trait that allows to get session
+pub trait UserSession {
+    fn get_session(&mut self) -> Session;
+}
+
+impl UserSession for HttpRequest {
+    fn get_session(&mut self) -> Session {
+        Session::get_session(&mut *self.extensions_mut())
+    }
+}
+
+impl UserSession for ServiceRequest {
+    fn get_session(&mut self) -> Session {
+        Session::get_session(&mut *self.extensions_mut())
+    }
+}
 
 #[derive(Default)]
 struct SessionInner {
@@ -119,11 +136,11 @@ impl Session {
         inner.state.clear()
     }
 
-    pub fn set_session<P>(
+    pub fn set_session(
         data: impl Iterator<Item = (String, String)>,
-        req: &mut ServiceRequest<P>,
+        req: &mut ServiceRequest,
     ) {
-        let session = Session::get_session(req);
+        let session = Session::get_session(&mut *req.extensions_mut());
         let mut inner = session.0.borrow_mut();
         inner.state.extend(data);
     }
@@ -144,12 +161,12 @@ impl Session {
         }
     }
 
-    fn get_session<R: HttpMessage>(req: R) -> Session {
-        if let Some(s_impl) = req.extensions().get::<Rc<RefCell<SessionInner>>>() {
+    fn get_session(extensions: &mut Extensions) -> Session {
+        if let Some(s_impl) = extensions.get::<Rc<RefCell<SessionInner>>>() {
             return Session(Rc::clone(&s_impl));
         }
         let inner = Rc::new(RefCell::new(SessionInner::default()));
-        req.extensions_mut().insert(inner.clone());
+        extensions.insert(inner.clone());
         Session(inner)
     }
 }
@@ -172,12 +189,54 @@ impl Session {
 /// }
 /// # fn main() {}
 /// ```
-impl<P> FromRequest<P> for Session {
+impl FromRequest for Session {
     type Error = Error;
     type Future = Result<Session, Error>;
+    type Config = ();
 
     #[inline]
-    fn from_request(req: &mut ServiceFromRequest<P>) -> Self::Future {
-        Ok(Session::get_session(req))
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        Ok(Session::get_session(&mut *req.extensions_mut()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{test, HttpResponse};
+
+    use super::*;
+
+    #[test]
+    fn session() {
+        let mut req = test::TestRequest::default().to_srv_request();
+
+        Session::set_session(
+            vec![("key".to_string(), "\"value\"".to_string())].into_iter(),
+            &mut req,
+        );
+        let session = Session::get_session(&mut *req.extensions_mut());
+        let res = session.get::<String>("key").unwrap();
+        assert_eq!(res, Some("value".to_string()));
+
+        session.set("key2", "value2".to_string()).unwrap();
+        session.remove("key");
+
+        let mut res = req.into_response(HttpResponse::Ok().finish());
+        let changes: Vec<_> = Session::get_changes(&mut res).unwrap().collect();
+        assert_eq!(changes, [("key2".to_string(), "\"value2\"".to_string())]);
+    }
+
+    #[test]
+    fn get_session() {
+        let mut req = test::TestRequest::default().to_srv_request();
+
+        Session::set_session(
+            vec![("key".to_string(), "\"value\"".to_string())].into_iter(),
+            &mut req,
+        );
+
+        let session = req.get_session();
+        let res = session.get::<String>("key").unwrap();
+        assert_eq!(res, Some("value".to_string()));
     }
 }

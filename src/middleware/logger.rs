@@ -12,10 +12,11 @@ use futures::{Async, Future, Poll};
 use regex::Regex;
 use time;
 
-use crate::dev::{BodyLength, MessageBody, ResponseBody};
+use crate::dev::{BodySize, MessageBody, ResponseBody};
 use crate::error::{Error, Result};
+use crate::http::{HeaderName, HttpTryFrom};
 use crate::service::{ServiceRequest, ServiceResponse};
-use crate::{HttpMessage, HttpResponse};
+use crate::HttpResponse;
 
 /// `Middleware` for logging request and response info to the terminal.
 ///
@@ -41,8 +42,8 @@ use crate::{HttpMessage, HttpResponse};
 ///     env_logger::init();
 ///
 ///     let app = App::new()
-///         .middleware(Logger::default())
-///         .middleware(Logger::new("%a %{User-Agent}i"));
+///         .wrap(Logger::default())
+///         .wrap(Logger::new("%a %{User-Agent}i"));
 /// }
 /// ```
 ///
@@ -64,6 +65,8 @@ use crate::{HttpMessage, HttpResponse};
 /// .06f format
 ///
 /// `%D`  Time taken to serve the request, in milliseconds
+///
+/// `%U`  Request URL
 ///
 /// `%{FOO}i`  request.headers['FOO']
 ///
@@ -111,14 +114,14 @@ impl Default for Logger {
     }
 }
 
-impl<S, P, B> Transform<S> for Logger
+impl<S, B> Transform<S> for Logger
 where
-    S: Service<Request = ServiceRequest<P>, Response = ServiceResponse<B>>,
+    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     B: MessageBody,
 {
-    type Request = ServiceRequest<P>;
+    type Request = ServiceRequest;
     type Response = ServiceResponse<StreamLog<B>>;
-    type Error = S::Error;
+    type Error = Error;
     type InitError = ();
     type Transform = LoggerMiddleware<S>;
     type Future = FutureResult<Self::Transform, Self::InitError>;
@@ -137,21 +140,21 @@ pub struct LoggerMiddleware<S> {
     service: S,
 }
 
-impl<S, P, B> Service for LoggerMiddleware<S>
+impl<S, B> Service for LoggerMiddleware<S>
 where
-    S: Service<Request = ServiceRequest<P>, Response = ServiceResponse<B>>,
+    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     B: MessageBody,
 {
-    type Request = ServiceRequest<P>;
+    type Request = ServiceRequest;
     type Response = ServiceResponse<StreamLog<B>>;
-    type Error = S::Error;
-    type Future = LoggerResponse<S, P, B>;
+    type Error = Error;
+    type Future = LoggerResponse<S, B>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
         self.service.poll_ready()
     }
 
-    fn call(&mut self, req: ServiceRequest<P>) -> Self::Future {
+    fn call(&mut self, req: ServiceRequest) -> Self::Future {
         if self.inner.exclude.contains(req.path()) {
             LoggerResponse {
                 fut: self.service.call(req),
@@ -177,7 +180,7 @@ where
 }
 
 #[doc(hidden)]
-pub struct LoggerResponse<S, P, B>
+pub struct LoggerResponse<S, B>
 where
     B: MessageBody,
     S: Service,
@@ -185,23 +188,23 @@ where
     fut: S::Future,
     time: time::Tm,
     format: Option<Format>,
-    _t: PhantomData<(P, B)>,
+    _t: PhantomData<(B,)>,
 }
 
-impl<S, P, B> Future for LoggerResponse<S, P, B>
+impl<S, B> Future for LoggerResponse<S, B>
 where
     B: MessageBody,
-    S: Service<Request = ServiceRequest<P>, Response = ServiceResponse<B>>,
+    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
 {
     type Item = ServiceResponse<StreamLog<B>>;
-    type Error = S::Error;
+    type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let res = futures::try_ready!(self.fut.poll());
 
         if let Some(ref mut format) = self.format {
             for unit in &mut format.0 {
-                unit.render_response(&res);
+                unit.render_response(res.response());
             }
         }
 
@@ -238,8 +241,8 @@ impl<B> Drop for StreamLog<B> {
 }
 
 impl<B: MessageBody> MessageBody for StreamLog<B> {
-    fn length(&self) -> BodyLength {
-        self.body.length()
+    fn size(&self) -> BodySize {
+        self.body.size()
     }
 
     fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
@@ -272,7 +275,7 @@ impl Format {
     /// Returns `None` if the format string syntax is incorrect.
     pub fn new(s: &str) -> Format {
         log::trace!("Access log format: {}", s);
-        let fmt = Regex::new(r"%(\{([A-Za-z0-9\-_]+)\}([ioe])|[atPrsbTD]?)").unwrap();
+        let fmt = Regex::new(r"%(\{([A-Za-z0-9\-_]+)\}([ioe])|[atPrUsbTD]?)").unwrap();
 
         let mut idx = 0;
         let mut results = Vec::new();
@@ -286,8 +289,12 @@ impl Format {
 
             if let Some(key) = cap.get(2) {
                 results.push(match cap.get(3).unwrap().as_str() {
-                    "i" => FormatText::RequestHeader(key.as_str().to_owned()),
-                    "o" => FormatText::ResponseHeader(key.as_str().to_owned()),
+                    "i" => FormatText::RequestHeader(
+                        HeaderName::try_from(key.as_str()).unwrap(),
+                    ),
+                    "o" => FormatText::ResponseHeader(
+                        HeaderName::try_from(key.as_str()).unwrap(),
+                    ),
                     "e" => FormatText::EnvironHeader(key.as_str().to_owned()),
                     _ => unreachable!(),
                 })
@@ -300,6 +307,7 @@ impl Format {
                     "r" => FormatText::RequestLine,
                     "s" => FormatText::ResponseStatus,
                     "b" => FormatText::ResponseSize,
+                    "U" => FormatText::UrlPath,
                     "T" => FormatText::Time,
                     "D" => FormatText::TimeMillis,
                     _ => FormatText::Str(m.as_str().to_owned()),
@@ -328,8 +336,9 @@ pub enum FormatText {
     Time,
     TimeMillis,
     RemoteAddr,
-    RequestHeader(String),
-    ResponseHeader(String),
+    UrlPath,
+    RequestHeader(HeaderName),
+    ResponseHeader(HeaderName),
     EnvironHeader(String),
 }
 
@@ -354,13 +363,6 @@ impl FormatText {
                 let rt = (rt.num_nanoseconds().unwrap_or(0) as f64) / 1_000_000.0;
                 fmt.write_fmt(format_args!("{:.6}", rt))
             }
-            // FormatText::RemoteAddr => {
-            //     if let Some(remote) = req.connection_info().remote() {
-            //         return remote.fmt(fmt);
-            //     } else {
-            //         "-".fmt(fmt)
-            //     }
-            // }
             FormatText::EnvironHeader(ref name) => {
                 if let Ok(val) = env::var(name) {
                     fmt.write_fmt(format_args!("{}", val))
@@ -393,7 +395,7 @@ impl FormatText {
         }
     }
 
-    fn render_request<P>(&mut self, now: time::Tm, req: &ServiceRequest<P>) {
+    fn render_request(&mut self, now: time::Tm, req: &ServiceRequest) {
         match *self {
             FormatText::RequestLine => {
                 *self = if req.query_string().is_empty() {
@@ -413,6 +415,7 @@ impl FormatText {
                     ))
                 };
             }
+            FormatText::UrlPath => *self = FormatText::Str(format!("{}", req.path())),
             FormatText::RequestTime => {
                 *self = FormatText::Str(format!(
                     "{:?}",
@@ -430,6 +433,14 @@ impl FormatText {
                     "-"
                 };
                 *self = FormatText::Str(s.to_string());
+            }
+            FormatText::RemoteAddr => {
+                let s = if let Some(remote) = req.connection_info().remote() {
+                    FormatText::Str(remote.to_string())
+                } else {
+                    FormatText::Str("-".to_string())
+                };
+                *self = s;
             }
             _ => (),
         }
@@ -454,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_logger() {
-        let srv = FnService::new(|req: ServiceRequest<_>| {
+        let srv = FnService::new(|req: ServiceRequest| {
             req.into_response(
                 HttpResponse::build(StatusCode::OK)
                     .header("X-Test", "ttt")
@@ -469,44 +480,71 @@ mod tests {
             header::USER_AGENT,
             header::HeaderValue::from_static("ACTIX-WEB"),
         )
-        .to_service();
+        .to_srv_request();
         let _res = block_on(srv.call(req));
     }
 
-    // #[test]
-    // fn test_default_format() {
-    //     let format = Format::default();
+    #[test]
+    fn test_url_path() {
+        let mut format = Format::new("%T %U");
+        let req = TestRequest::with_header(
+            header::USER_AGENT,
+            header::HeaderValue::from_static("ACTIX-WEB"),
+        )
+        .uri("/test/route/yeah")
+        .to_srv_request();
 
-    //     let req = TestRequest::with_header(
-    //         header::USER_AGENT,
-    //         header::HeaderValue::from_static("ACTIX-WEB"),
-    //     )
-    //     .finish();
-    //     let resp = HttpResponse::build(StatusCode::OK).force_close().finish();
-    //     let entry_time = time::now();
+        let now = time::now();
+        for unit in &mut format.0 {
+            unit.render_request(now, &req);
+        }
 
-    //     let render = |fmt: &mut Formatter| {
-    //         for unit in &format.0 {
-    //             unit.render(fmt, &req, &resp, entry_time)?;
-    //         }
-    //         Ok(())
-    //     };
-    //     let s = format!("{}", FormatDisplay(&render));
-    //     assert!(s.contains("GET / HTTP/1.1"));
-    //     assert!(s.contains("200 0"));
-    //     assert!(s.contains("ACTIX-WEB"));
+        let resp = HttpResponse::build(StatusCode::OK).force_close().finish();
+        for unit in &mut format.0 {
+            unit.render_response(&resp);
+        }
 
-    //     let req = TestRequest::with_uri("/?test").finish();
-    //     let resp = HttpResponse::build(StatusCode::OK).force_close().finish();
-    //     let entry_time = time::now();
+        let render = |fmt: &mut Formatter| {
+            for unit in &format.0 {
+                unit.render(fmt, 1024, now)?;
+            }
+            Ok(())
+        };
+        let s = format!("{}", FormatDisplay(&render));
+        println!("{}", s);
+        assert!(s.contains("/test/route/yeah"));
+    }
 
-    //     let render = |fmt: &mut Formatter| {
-    //         for unit in &format.0 {
-    //             unit.render(fmt, &req, &resp, entry_time)?;
-    //         }
-    //         Ok(())
-    //     };
-    //     let s = format!("{}", FormatDisplay(&render));
-    //     assert!(s.contains("GET /?test HTTP/1.1"));
-    // }
+    #[test]
+    fn test_default_format() {
+        let mut format = Format::default();
+
+        let req = TestRequest::with_header(
+            header::USER_AGENT,
+            header::HeaderValue::from_static("ACTIX-WEB"),
+        )
+        .to_srv_request();
+
+        let now = time::now();
+        for unit in &mut format.0 {
+            unit.render_request(now, &req);
+        }
+
+        let resp = HttpResponse::build(StatusCode::OK).force_close().finish();
+        for unit in &mut format.0 {
+            unit.render_response(&resp);
+        }
+
+        let entry_time = time::now();
+        let render = |fmt: &mut Formatter| {
+            for unit in &format.0 {
+                unit.render(fmt, 1024, entry_time)?;
+            }
+            Ok(())
+        };
+        let s = format!("{}", FormatDisplay(&render));
+        assert!(s.contains("GET / HTTP/1.1"));
+        assert!(s.contains("200 1024"));
+        assert!(s.contains("ACTIX-WEB"));
+    }
 }

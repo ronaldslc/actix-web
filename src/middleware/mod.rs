@@ -1,18 +1,16 @@
-#[cfg(any(feature = "brotli", feature = "flate2"))]
+//! Middlewares
 mod compress;
-#[cfg(any(feature = "brotli", feature = "flate2"))]
-pub use self::compress::Compress;
+pub use self::compress::{BodyEncoding, Compress};
 
+pub mod cors;
 mod defaultheaders;
-mod errhandlers;
+pub mod errhandlers;
 mod logger;
+mod normalize;
 
 pub use self::defaultheaders::DefaultHeaders;
-pub use self::errhandlers::{ErrorHandlerResponse, ErrorHandlers};
 pub use self::logger::Logger;
+pub use self::normalize::NormalizePath;
 
-// #[cfg(feature = "session")]
-// pub use actix_session as session;
-
-#[cfg(feature = "session")]
+#[cfg(feature = "secure-cookies")]
 pub mod identity;

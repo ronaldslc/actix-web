@@ -1,6 +1,4 @@
 //! Error and Result module
-use std::fmt;
-
 pub use actix_http::error::*;
 use derive_more::{Display, From};
 use serde_json::error::Error as JsonError;
@@ -26,26 +24,6 @@ pub enum UrlGenerationError {
 /// `InternalServerError` for `UrlGeneratorError`
 impl ResponseError for UrlGenerationError {}
 
-/// Blocking operation execution error
-#[derive(Debug, Display)]
-pub enum BlockingError<E: fmt::Debug> {
-    #[display(fmt = "{:?}", _0)]
-    Error(E),
-    #[display(fmt = "Thread pool is gone")]
-    Canceled,
-}
-
-impl<E: fmt::Debug> ResponseError for BlockingError<E> {}
-
-impl<E: fmt::Debug> From<actix_rt::blocking::BlockingError<E>> for BlockingError<E> {
-    fn from(err: actix_rt::blocking::BlockingError<E>) -> Self {
-        match err {
-            actix_rt::blocking::BlockingError::Error(e) => BlockingError::Error(e),
-            actix_rt::blocking::BlockingError::Canceled => BlockingError::Canceled,
-        }
-    }
-}
-
 /// A set of errors that can occur during parsing urlencoded payloads
 #[derive(Debug, Display, From)]
 pub enum UrlencodedError {
@@ -53,7 +31,7 @@ pub enum UrlencodedError {
     #[display(fmt = "Can not decode chunked transfer encoding")]
     Chunked,
     /// Payload size is bigger than allowed. (default: 256kB)
-    #[display(fmt = "Urlencoded payload size is bigger than allowed. (default: 256kB)")]
+    #[display(fmt = "Urlencoded payload size is bigger than allowed (default: 256kB)")]
     Overflow,
     /// Payload size is now known
     #[display(fmt = "Payload size is now known")]
@@ -88,7 +66,7 @@ impl ResponseError for UrlencodedError {
 #[derive(Debug, Display, From)]
 pub enum JsonPayloadError {
     /// Payload size is bigger than allowed. (default: 32kB)
-    #[display(fmt = "Json payload size is bigger than allowed.")]
+    #[display(fmt = "Json payload size is bigger than allowed")]
     Overflow,
     /// Content type error
     #[display(fmt = "Content type error")]
@@ -101,7 +79,7 @@ pub enum JsonPayloadError {
     Payload(PayloadError),
 }
 
-/// Return `BadRequest` for `UrlencodedError`
+/// Return `BadRequest` for `JsonPayloadError`
 impl ResponseError for JsonPayloadError {
     fn error_response(&self) -> HttpResponse {
         match *self {

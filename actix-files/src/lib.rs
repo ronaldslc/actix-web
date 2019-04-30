@@ -3,39 +3,37 @@ use std::cell::RefCell;
 use std::fmt::Write;
 use std::fs::{DirEntry, File};
 use std::io::{Read, Seek};
-use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::{cmp, io};
 
+use actix_service::boxed::{self, BoxedNewService, BoxedService};
+use actix_service::{IntoNewService, NewService, Service};
+use actix_web::dev::{
+    AppService, HttpServiceFactory, Payload, ResourceDef, ServiceRequest,
+    ServiceResponse,
+};
+use actix_web::error::{BlockingError, Error, ErrorInternalServerError};
+use actix_web::http::header::DispositionType;
+use actix_web::{web, FromRequest, HttpRequest, HttpResponse, Responder};
 use bytes::Bytes;
+use futures::future::{ok, Either, FutureResult};
 use futures::{Async, Future, Poll, Stream};
 use mime;
 use mime_guess::get_mime_type;
 use percent_encoding::{utf8_percent_encode, DEFAULT_ENCODE_SET};
 use v_htmlescape::escape as escape_html_entity;
 
-use actix_service::{boxed::BoxedNewService, NewService, Service};
-use actix_web::dev::{
-    HttpServiceFactory, ResourceDef, ServiceConfig, ServiceFromRequest, ServiceRequest,
-    ServiceResponse,
-};
-use actix_web::error::{BlockingError, Error, ErrorInternalServerError};
-use actix_web::{web, FromRequest, HttpRequest, HttpResponse, Responder};
-use futures::future::{ok, FutureResult};
-
-mod config;
 mod error;
 mod named;
 mod range;
 
 use self::error::{FilesError, UriSegmentError};
-pub use crate::config::{DefaultConfig, StaticFileConfig};
 pub use crate::named::NamedFile;
 pub use crate::range::HttpRange;
 
-type HttpNewService<P> =
-    BoxedNewService<(), ServiceRequest<P>, ServiceResponse, Error, ()>;
+type HttpService = BoxedService<ServiceRequest, ServiceResponse, Error>;
+type HttpNewService = BoxedNewService<(), ServiceRequest, ServiceResponse, Error, ()>;
 
 /// Return the MIME type associated with a filename extension (case-insensitive).
 /// If `ext` is empty or no associated type for the extension was found, returns
@@ -211,6 +209,8 @@ fn directory_listing(
     ))
 }
 
+type MimeOverride = Fn(&mime::Name) -> DispositionType;
+
 /// Static files handling
 ///
 /// `Files` service must be registered with `App::service()` method.
@@ -224,34 +224,39 @@ fn directory_listing(
 ///         .service(fs::Files::new("/static", "."));
 /// }
 /// ```
-pub struct Files<S, C = DefaultConfig> {
+pub struct Files {
     path: String,
     directory: PathBuf,
     index: Option<String>,
     show_index: bool,
-    default: Rc<RefCell<Option<Rc<HttpNewService<S>>>>>,
+    default: Rc<RefCell<Option<Rc<HttpNewService>>>>,
     renderer: Rc<DirectoryRenderer>,
-    _chunk_size: usize,
-    _follow_symlinks: bool,
-    _cd_map: PhantomData<C>,
+    mime_override: Option<Rc<MimeOverride>>,
+    file_flags: named::Flags,
 }
 
-impl<S: 'static> Files<S> {
+impl Clone for Files {
+    fn clone(&self) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            index: self.index.clone(),
+            show_index: self.show_index,
+            default: self.default.clone(),
+            renderer: self.renderer.clone(),
+            file_flags: self.file_flags,
+            path: self.path.clone(),
+            mime_override: self.mime_override.clone(),
+        }
+    }
+}
+
+impl Files {
     /// Create new `Files` instance for specified base directory.
     ///
     /// `File` uses `ThreadPool` for blocking filesystem operations.
     /// By default pool with 5x threads of available cpus is used.
     /// Pool size can be changed by setting ACTIX_CPU_POOL environment variable.
-    pub fn new<T: Into<PathBuf>>(path: &str, dir: T) -> Files<S> {
-        Self::with_config(path, dir, DefaultConfig)
-    }
-}
-
-impl<S: 'static, C: StaticFileConfig> Files<S, C> {
-    /// Create new `Files` instance for specified base directory.
-    ///
-    /// Identical with `new` but allows to specify configiration to use.
-    pub fn with_config<T: Into<PathBuf>>(path: &str, dir: T, _: C) -> Files<S, C> {
+    pub fn new<T: Into<PathBuf>>(path: &str, dir: T) -> Files {
         let dir = dir.into().canonicalize().unwrap_or_else(|_| PathBuf::new());
         if !dir.is_dir() {
             log::error!("Specified path is not a directory");
@@ -264,9 +269,8 @@ impl<S: 'static, C: StaticFileConfig> Files<S, C> {
             show_index: false,
             default: Rc::new(RefCell::new(None)),
             renderer: Rc::new(directory_listing),
-            _chunk_size: 0,
-            _follow_symlinks: false,
-            _cd_map: PhantomData,
+            mime_override: None,
+            file_flags: named::Flags::default(),
         }
     }
 
@@ -289,22 +293,63 @@ impl<S: 'static, C: StaticFileConfig> Files<S, C> {
         self
     }
 
+    /// Specifies mime override callback
+    pub fn mime_override<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&mime::Name) -> DispositionType + 'static,
+    {
+        self.mime_override = Some(Rc::new(f));
+        self
+    }
+
     /// Set index file
     ///
     /// Shows specific index file for directory "/" instead of
     /// showing files listing.
-    pub fn index_file<T: Into<String>>(mut self, index: T) -> Files<S, C> {
+    pub fn index_file<T: Into<String>>(mut self, index: T) -> Self {
         self.index = Some(index.into());
+        self
+    }
+
+    #[inline]
+    ///Specifies whether to use ETag or not.
+    ///
+    ///Default is true.
+    pub fn use_etag(mut self, value: bool) -> Self {
+        self.file_flags.set(named::Flags::ETAG, value);
+        self
+    }
+
+    #[inline]
+    ///Specifies whether to use Last-Modified or not.
+    ///
+    ///Default is true.
+    pub fn use_last_modified(mut self, value: bool) -> Self {
+        self.file_flags.set(named::Flags::LAST_MD, value);
+        self
+    }
+
+    /// Sets default handler which is used when no matched file could be found.
+    pub fn default_handler<F, U>(mut self, f: F) -> Self
+    where
+        F: IntoNewService<U>,
+        U: NewService<
+                Request = ServiceRequest,
+                Response = ServiceResponse,
+                Error = Error,
+            > + 'static,
+    {
+        // create and configure default resource
+        self.default = Rc::new(RefCell::new(Some(Rc::new(boxed::new_service(
+            f.into_new_service().map_init_err(|_| ()),
+        )))));
+
         self
     }
 }
 
-impl<P, C> HttpServiceFactory<P> for Files<P, C>
-where
-    P: 'static,
-    C: StaticFileConfig + 'static,
-{
-    fn register(self, config: &mut ServiceConfig<P>) {
+impl HttpServiceFactory for Files {
+    fn register(self, config: &mut AppService) {
         if self.default.borrow().is_none() {
             *self.default.borrow_mut() = Some(config.default_service());
         }
@@ -317,94 +362,150 @@ where
     }
 }
 
-impl<P, C: StaticFileConfig + 'static> NewService for Files<P, C> {
-    type Request = ServiceRequest<P>;
+impl NewService for Files {
+    type Request = ServiceRequest;
     type Response = ServiceResponse;
     type Error = Error;
-    type Service = FilesService<P, C>;
+    type Service = FilesService;
     type InitError = ();
-    type Future = FutureResult<Self::Service, Self::InitError>;
+    type Future = Box<Future<Item = Self::Service, Error = Self::InitError>>;
 
     fn new_service(&self, _: &()) -> Self::Future {
-        ok(FilesService {
+        let mut srv = FilesService {
             directory: self.directory.clone(),
             index: self.index.clone(),
             show_index: self.show_index,
-            default: self.default.clone(),
+            default: None,
             renderer: self.renderer.clone(),
-            _chunk_size: self._chunk_size,
-            _follow_symlinks: self._follow_symlinks,
-            _cd_map: self._cd_map,
-        })
+            mime_override: self.mime_override.clone(),
+            file_flags: self.file_flags,
+        };
+
+        if let Some(ref default) = *self.default.borrow() {
+            Box::new(
+                default
+                    .new_service(&())
+                    .map(move |default| {
+                        srv.default = Some(default);
+                        srv
+                    })
+                    .map_err(|_| ()),
+            )
+        } else {
+            Box::new(ok(srv))
+        }
     }
 }
 
-pub struct FilesService<S, C = DefaultConfig> {
+pub struct FilesService {
     directory: PathBuf,
     index: Option<String>,
     show_index: bool,
-    default: Rc<RefCell<Option<Rc<HttpNewService<S>>>>>,
+    default: Option<HttpService>,
     renderer: Rc<DirectoryRenderer>,
-    _chunk_size: usize,
-    _follow_symlinks: bool,
-    _cd_map: PhantomData<C>,
+    mime_override: Option<Rc<MimeOverride>>,
+    file_flags: named::Flags,
 }
 
-impl<P, C: StaticFileConfig> Service for FilesService<P, C> {
-    type Request = ServiceRequest<P>;
+impl FilesService {
+    fn handle_err(
+        &mut self,
+        e: io::Error,
+        req: ServiceRequest,
+    ) -> Either<
+        FutureResult<ServiceResponse, Error>,
+        Box<Future<Item = ServiceResponse, Error = Error>>,
+    > {
+        log::debug!("Files: Failed to handle {}: {}", req.path(), e);
+        if let Some(ref mut default) = self.default {
+            default.call(req)
+        } else {
+            Either::A(ok(req.error_response(e)))
+        }
+    }
+}
+
+impl Service for FilesService {
+    type Request = ServiceRequest;
     type Response = ServiceResponse;
     type Error = Error;
-    type Future = FutureResult<Self::Response, Self::Error>;
+    type Future = Either<
+        FutureResult<Self::Response, Self::Error>,
+        Box<Future<Item = Self::Response, Error = Self::Error>>,
+    >;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
         Ok(Async::Ready(()))
     }
 
-    fn call(&mut self, req: ServiceRequest<P>) -> Self::Future {
-        let (req, _) = req.into_parts();
+    fn call(&mut self, req: ServiceRequest) -> Self::Future {
+        // let (req, pl) = req.into_parts();
 
         let real_path = match PathBufWrp::get_pathbuf(req.match_info().path()) {
             Ok(item) => item,
-            Err(e) => return ok(ServiceResponse::from_err(e, req.clone())),
+            Err(e) => return Either::A(ok(req.error_response(e))),
         };
 
         // full filepath
         let path = match self.directory.join(&real_path.0).canonicalize() {
             Ok(path) => path,
-            Err(e) => return ok(ServiceResponse::from_err(e, req.clone())),
+            Err(e) => return self.handle_err(e, req),
         };
 
         if path.is_dir() {
             if let Some(ref redir_index) = self.index {
                 let path = path.join(redir_index);
 
-                match NamedFile::open_with_config(path, C::default()) {
-                    Ok(named_file) => match named_file.respond_to(&req) {
-                        Ok(item) => ok(ServiceResponse::new(req.clone(), item)),
-                        Err(e) => ok(ServiceResponse::from_err(e, req.clone())),
-                    },
-                    Err(e) => ok(ServiceResponse::from_err(e, req.clone())),
+                match NamedFile::open(path) {
+                    Ok(mut named_file) => {
+                        if let Some(ref mime_override) = self.mime_override {
+                            let new_disposition =
+                                mime_override(&named_file.content_type.type_());
+                            named_file.content_disposition.disposition = new_disposition;
+                        }
+
+                        named_file.flags = self.file_flags;
+                        let (req, _) = req.into_parts();
+                        Either::A(ok(match named_file.respond_to(&req) {
+                            Ok(item) => ServiceResponse::new(req, item),
+                            Err(e) => ServiceResponse::from_err(e, req),
+                        }))
+                    }
+                    Err(e) => return self.handle_err(e, req),
                 }
             } else if self.show_index {
                 let dir = Directory::new(self.directory.clone(), path);
+                let (req, _) = req.into_parts();
                 let x = (self.renderer)(&dir, &req);
                 match x {
-                    Ok(resp) => ok(resp),
-                    Err(e) => ok(ServiceResponse::from_err(e, req.clone())),
+                    Ok(resp) => Either::A(ok(resp)),
+                    Err(e) => return Either::A(ok(ServiceResponse::from_err(e, req))),
                 }
             } else {
-                ok(ServiceResponse::from_err(
+                Either::A(ok(ServiceResponse::from_err(
                     FilesError::IsDirectory,
-                    req.clone(),
-                ))
+                    req.into_parts().0,
+                )))
             }
         } else {
-            match NamedFile::open_with_config(path, C::default()) {
-                Ok(named_file) => match named_file.respond_to(&req) {
-                    Ok(item) => ok(ServiceResponse::new(req.clone(), item)),
-                    Err(e) => ok(ServiceResponse::from_err(e, req.clone())),
-                },
-                Err(e) => ok(ServiceResponse::from_err(e, req.clone())),
+            match NamedFile::open(path) {
+                Ok(mut named_file) => {
+                    if let Some(ref mime_override) = self.mime_override {
+                        let new_disposition =
+                            mime_override(&named_file.content_type.type_());
+                        named_file.content_disposition.disposition = new_disposition;
+                    }
+
+                    named_file.flags = self.file_flags;
+                    let (req, _) = req.into_parts();
+                    match named_file.respond_to(&req) {
+                        Ok(item) => {
+                            Either::A(ok(ServiceResponse::new(req.clone(), item)))
+                        }
+                        Err(e) => Either::A(ok(ServiceResponse::from_err(e, req))),
+                    }
+                }
+                Err(e) => self.handle_err(e, req),
             }
         }
     }
@@ -442,11 +543,12 @@ impl PathBufWrp {
     }
 }
 
-impl<P> FromRequest<P> for PathBufWrp {
+impl FromRequest for PathBufWrp {
     type Error = UriSegmentError;
     type Future = Result<Self, Self::Error>;
+    type Config = ();
 
-    fn from_request(req: &mut ServiceFromRequest<P>) -> Self::Future {
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         PathBufWrp::get_pathbuf(req.match_info().path())
     }
 }
@@ -461,7 +563,11 @@ mod tests {
     use bytes::BytesMut;
 
     use super::*;
-    use actix_web::http::{header, header::DispositionType, Method, StatusCode};
+    use actix_web::http::header::{
+        self, ContentDisposition, DispositionParam, DispositionType,
+    };
+    use actix_web::http::{Method, StatusCode};
+    use actix_web::middleware::Compress;
     use actix_web::test::{self, TestRequest};
     use actix_web::App;
 
@@ -578,7 +684,6 @@ mod tests {
 
     #[test]
     fn test_named_file_image_attachment() {
-        use header::{ContentDisposition, DispositionParam, DispositionType};
         let cd = ContentDisposition {
             disposition: DispositionType::Attachment,
             parameters: vec![DispositionParam::Filename(String::from("test.png"))],
@@ -603,53 +708,6 @@ mod tests {
         assert_eq!(
             resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
             "attachment; filename=\"test.png\""
-        );
-    }
-
-    #[derive(Default)]
-    pub struct AllAttachmentConfig;
-    impl StaticFileConfig for AllAttachmentConfig {
-        fn content_disposition_map(_typ: mime::Name) -> DispositionType {
-            DispositionType::Attachment
-        }
-    }
-
-    #[derive(Default)]
-    pub struct AllInlineConfig;
-    impl StaticFileConfig for AllInlineConfig {
-        fn content_disposition_map(_typ: mime::Name) -> DispositionType {
-            DispositionType::Inline
-        }
-    }
-
-    #[test]
-    fn test_named_file_image_attachment_and_custom_config() {
-        let file =
-            NamedFile::open_with_config("tests/test.png", AllAttachmentConfig).unwrap();
-
-        let req = TestRequest::default().to_http_request();
-        let resp = file.respond_to(&req).unwrap();
-        assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).unwrap(),
-            "image/png"
-        );
-        assert_eq!(
-            resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
-            "attachment; filename=\"test.png\""
-        );
-
-        let file =
-            NamedFile::open_with_config("tests/test.png", AllInlineConfig).unwrap();
-
-        let req = TestRequest::default().to_http_request();
-        let resp = file.respond_to(&req).unwrap();
-        assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).unwrap(),
-            "image/png"
-        );
-        assert_eq!(
-            resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
-            "inline; filename=\"test.png\""
         );
     }
 
@@ -703,6 +761,34 @@ mod tests {
     }
 
     #[test]
+    fn test_mime_override() {
+        fn all_attachment(_: &mime::Name) -> DispositionType {
+            DispositionType::Attachment
+        }
+
+        let mut srv = test::init_service(
+            App::new().service(
+                Files::new("/", ".")
+                    .mime_override(all_attachment)
+                    .index_file("Cargo.toml"),
+            ),
+        );
+
+        let request = TestRequest::get().uri("/").to_request();
+        let response = test::call_service(&mut srv, request);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .expect("To have CONTENT_DISPOSITION");
+        let content_disposition = content_disposition
+            .to_str()
+            .expect("Convert CONTENT_DISPOSITION to str");
+        assert_eq!(content_disposition, "attachment; filename=\"Cargo.toml\"");
+    }
+
+    #[test]
     fn test_named_file_ranges_status_code() {
         let mut srv = test::init_service(
             App::new().service(Files::new("/test", ".").index_file("Cargo.toml")),
@@ -713,7 +799,7 @@ mod tests {
             .uri("/t%65st/Cargo.toml")
             .header(header::RANGE, "bytes=10-20")
             .to_request();
-        let response = test::call_success(&mut srv, request);
+        let response = test::call_service(&mut srv, request);
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
 
         // Invalid range header
@@ -721,7 +807,7 @@ mod tests {
             .uri("/t%65st/Cargo.toml")
             .header(header::RANGE, "bytes=1-0")
             .to_request();
-        let response = test::call_success(&mut srv, request);
+        let response = test::call_service(&mut srv, request);
 
         assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
     }
@@ -738,7 +824,7 @@ mod tests {
             .header(header::RANGE, "bytes=10-20")
             .to_request();
 
-        let response = test::call_success(&mut srv, request);
+        let response = test::call_service(&mut srv, request);
         let contentrange = response
             .headers()
             .get(header::CONTENT_RANGE)
@@ -753,7 +839,7 @@ mod tests {
             .uri("/t%65st/tests/test.binary")
             .header(header::RANGE, "bytes=10-5")
             .to_request();
-        let response = test::call_success(&mut srv, request);
+        let response = test::call_service(&mut srv, request);
 
         let contentrange = response
             .headers()
@@ -776,7 +862,7 @@ mod tests {
             .uri("/t%65st/tests/test.binary")
             .header(header::RANGE, "bytes=10-20")
             .to_request();
-        let response = test::call_success(&mut srv, request);
+        let response = test::call_service(&mut srv, request);
 
         let contentlength = response
             .headers()
@@ -792,7 +878,7 @@ mod tests {
             .uri("/t%65st/tests/test.binary")
             .header(header::RANGE, "bytes=10-8")
             .to_request();
-        let response = test::call_success(&mut srv, request);
+        let response = test::call_service(&mut srv, request);
         assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
 
         // Without range header
@@ -800,7 +886,7 @@ mod tests {
             .uri("/t%65st/tests/test.binary")
             // .no_default_headers()
             .to_request();
-        let response = test::call_success(&mut srv, request);
+        let response = test::call_service(&mut srv, request);
 
         let contentlength = response
             .headers()
@@ -815,7 +901,7 @@ mod tests {
         let request = TestRequest::get()
             .uri("/t%65st/tests/test.binary")
             .to_request();
-        let mut response = test::call_success(&mut srv, request);
+        let mut response = test::call_service(&mut srv, request);
 
         // with enabled compression
         // {
@@ -846,7 +932,7 @@ mod tests {
         let request = TestRequest::get()
             .uri("/tests/test%20space.binary")
             .to_request();
-        let mut response = test::call_success(&mut srv, request);
+        let mut response = test::call_service(&mut srv, request);
         assert_eq!(response.status(), StatusCode::OK);
 
         let bytes =
@@ -860,60 +946,69 @@ mod tests {
         assert_eq!(bytes.freeze(), data);
     }
 
-    #[derive(Default)]
-    pub struct OnlyMethodHeadConfig;
-    impl StaticFileConfig for OnlyMethodHeadConfig {
-        fn is_method_allowed(method: &Method) -> bool {
-            match *method {
-                Method::HEAD => true,
-                _ => false,
-            }
-        }
-    }
-
     #[test]
     fn test_named_file_not_allowed() {
-        let file =
-            NamedFile::open_with_config("Cargo.toml", OnlyMethodHeadConfig).unwrap();
+        let file = NamedFile::open("Cargo.toml").unwrap();
         let req = TestRequest::default()
             .method(Method::POST)
             .to_http_request();
         let resp = file.respond_to(&req).unwrap();
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 
-        let file =
-            NamedFile::open_with_config("Cargo.toml", OnlyMethodHeadConfig).unwrap();
+        let file = NamedFile::open("Cargo.toml").unwrap();
         let req = TestRequest::default().method(Method::PUT).to_http_request();
         let resp = file.respond_to(&req).unwrap();
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-
-        let file =
-            NamedFile::open_with_config("Cargo.toml", OnlyMethodHeadConfig).unwrap();
-        let req = TestRequest::default().method(Method::GET).to_http_request();
-        let resp = file.respond_to(&req).unwrap();
-        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
-    //     #[test]
-    //     fn test_named_file_content_encoding() {
-    //         let req = TestRequest::default().method(Method::GET).finish();
-    //         let file = NamedFile::open("Cargo.toml").unwrap();
+    #[test]
+    fn test_named_file_content_encoding() {
+        let mut srv = test::init_service(App::new().wrap(Compress::default()).service(
+            web::resource("/").to(|| {
+                NamedFile::open("Cargo.toml")
+                    .unwrap()
+                    .set_content_encoding(header::ContentEncoding::Identity)
+            }),
+        ));
 
-    //         assert!(file.encoding.is_none());
-    //         let resp = file
-    //             .set_content_encoding(ContentEncoding::Identity)
-    //             .respond_to(&req)
-    //             .unwrap();
-
-    //         assert!(resp.content_encoding().is_some());
-    //         assert_eq!(resp.content_encoding().unwrap().as_str(), "identity");
-    //     }
+        let request = TestRequest::get()
+            .uri("/")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .to_request();
+        let res = test::call_service(&mut srv, request);
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!res.headers().contains_key(header::CONTENT_ENCODING));
+    }
 
     #[test]
-    fn test_named_file_any_method() {
-        let req = TestRequest::default()
-            .method(Method::POST)
-            .to_http_request();
+    fn test_named_file_content_encoding_gzip() {
+        let mut srv = test::init_service(App::new().wrap(Compress::default()).service(
+            web::resource("/").to(|| {
+                NamedFile::open("Cargo.toml")
+                    .unwrap()
+                    .set_content_encoding(header::ContentEncoding::Gzip)
+            }),
+        ));
+
+        let request = TestRequest::get()
+            .uri("/")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .to_request();
+        let res = test::call_service(&mut srv, request);
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(header::CONTENT_ENCODING)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "gzip"
+        );
+    }
+
+    #[test]
+    fn test_named_file_allowed_method() {
+        let req = TestRequest::default().method(Method::GET).to_http_request();
         let file = NamedFile::open("Cargo.toml").unwrap();
         let resp = file.respond_to(&req).unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -926,20 +1021,20 @@ mod tests {
         );
         let req = TestRequest::with_uri("/missing").to_request();
 
-        let resp = test::call_success(&mut srv, req);
+        let resp = test::call_service(&mut srv, req);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let mut srv = test::init_service(App::new().service(Files::new("/", ".")));
 
         let req = TestRequest::default().to_request();
-        let resp = test::call_success(&mut srv, req);
+        let resp = test::call_service(&mut srv, req);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let mut srv = test::init_service(
             App::new().service(Files::new("/", ".").show_files_listing()),
         );
         let req = TestRequest::with_uri("/tests").to_request();
-        let mut resp = test::call_success(&mut srv, req);
+        let mut resp = test::call_service(&mut srv, req);
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
@@ -956,26 +1051,33 @@ mod tests {
 
     #[test]
     fn test_static_files_bad_directory() {
-        let _st: Files<()> = Files::new("/", "missing");
-        let _st: Files<()> = Files::new("/", "Cargo.toml");
+        let _st: Files = Files::new("/", "missing");
+        let _st: Files = Files::new("/", "Cargo.toml");
     }
 
-    //     #[test]
-    //     fn test_default_handler_file_missing() {
-    //         let st = Files::new(".")
-    //             .default_handler(|_: &_| "default content");
-    //         let req = TestRequest::with_uri("/missing")
-    //             .param("tail", "missing")
-    //             .finish();
+    #[test]
+    fn test_default_handler_file_missing() {
+        let mut st = test::block_on(
+            Files::new("/", ".")
+                .default_handler(|req: ServiceRequest| {
+                    Ok(req.into_response(HttpResponse::Ok().body("default content")))
+                })
+                .new_service(&()),
+        )
+        .unwrap();
+        let req = TestRequest::with_uri("/missing").to_srv_request();
 
-    //         let resp = st.handle(&req).respond_to(&req).unwrap();
-    //         let resp = resp.as_msg();
-    //         assert_eq!(resp.status(), StatusCode::OK);
-    //         assert_eq!(
-    //             resp.body(),
-    //             &Body::Binary(Binary::Slice(b"default content"))
-    //         );
-    //     }
+        let mut resp = test::call_service(&mut st, req);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes =
+            test::block_on(resp.take_body().fold(BytesMut::new(), |mut b, c| {
+                b.extend(c);
+                Ok::<_, Error>(b)
+            }))
+            .unwrap();
+
+        assert_eq!(bytes.freeze(), Bytes::from_static(b"default content"));
+    }
 
     //     #[test]
     //     fn test_serve_index() {

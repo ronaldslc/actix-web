@@ -26,19 +26,19 @@ fn main() -> std::io::Result<()> {
 
     HttpServer::new(|| {
         App::new()
-            .middleware(middleware::DefaultHeaders::new().header("X-Version", "0.2"))
-            .middleware(middleware::Compress::default())
-            .middleware(middleware::Logger::default())
+            .wrap(middleware::DefaultHeaders::new().header("X-Version", "0.2"))
+            .wrap(middleware::Compress::default())
+            .wrap(middleware::Logger::default())
             .service(index)
             .service(no_params)
             .service(
                 web::resource("/resource2/index.html")
-                    .middleware(
+                    .wrap(
                         middleware::DefaultHeaders::new().header("X-Version-R2", "0.3"),
                     )
-                    .default_resource(|r| {
-                        r.route(web::route().to(|| HttpResponse::MethodNotAllowed()))
-                    })
+                    .default_service(
+                        web::route().to(|| HttpResponse::MethodNotAllowed()),
+                    )
                     .route(web::get().to_async(index_async)),
             )
             .service(web::resource("/test1.html").to(|| "Test\r\n"))
