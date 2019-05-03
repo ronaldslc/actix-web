@@ -1,120 +1,195 @@
-use std::marker::PhantomData;
+use std::cell::RefCell;
 use std::rc::Rc;
 
-use futures::{Async, Future, Poll};
+use actix_http::{http::Method, Error, Extensions};
+use actix_service::{NewService, Service};
+use futures::future::{ok, Either, FutureResult};
+use futures::{Async, Future, IntoFuture, Poll};
 
-use error::Error;
-use handler::{
-    AsyncHandler, AsyncResult, AsyncResultItem, FromRequest, Handler, Responder,
-    RouteHandler, WrapHandler,
-};
-use http::StatusCode;
-use httprequest::HttpRequest;
-use httpresponse::HttpResponse;
-use middleware::{
-    Finished as MiddlewareFinished, Middleware, Response as MiddlewareResponse,
-    Started as MiddlewareStarted,
-};
-use pred::Predicate;
-use with::{WithAsyncFactory, WithFactory};
+use crate::data::RouteData;
+use crate::extract::FromRequest;
+use crate::guard::{self, Guard};
+use crate::handler::{AsyncFactory, AsyncHandler, Extract, Factory, Handler};
+use crate::responder::Responder;
+use crate::service::{ServiceRequest, ServiceResponse};
+use crate::HttpResponse;
+
+type BoxedRouteService<Req, Res> = Box<
+    Service<
+        Request = Req,
+        Response = Res,
+        Error = Error,
+        Future = Either<
+            FutureResult<Res, Error>,
+            Box<Future<Item = Res, Error = Error>>,
+        >,
+    >,
+>;
+
+type BoxedRouteNewService<Req, Res> = Box<
+    NewService<
+        Request = Req,
+        Response = Res,
+        Error = Error,
+        InitError = (),
+        Service = BoxedRouteService<Req, Res>,
+        Future = Box<Future<Item = BoxedRouteService<Req, Res>, Error = ()>>,
+    >,
+>;
 
 /// Resource route definition
 ///
 /// Route uses builder-like pattern for configuration.
 /// If handler is not explicitly set, default *404 Not Found* handler is used.
-pub struct Route<S> {
-    preds: Vec<Box<Predicate<S>>>,
-    handler: InnerHandler<S>,
+pub struct Route {
+    service: BoxedRouteNewService<ServiceRequest, ServiceResponse>,
+    guards: Rc<Vec<Box<Guard>>>,
+    data: Option<Extensions>,
+    data_ref: Rc<RefCell<Option<Rc<Extensions>>>>,
 }
 
-impl<S: 'static> Default for Route<S> {
-    fn default() -> Route<S> {
+impl Route {
+    /// Create new route which matches any request.
+    pub fn new() -> Route {
+        let data_ref = Rc::new(RefCell::new(None));
         Route {
-            preds: Vec::new(),
-            handler: InnerHandler::new(|_: &_| HttpResponse::new(StatusCode::NOT_FOUND)),
+            service: Box::new(RouteNewService::new(Extract::new(
+                data_ref.clone(),
+                Handler::new(|| HttpResponse::NotFound()),
+            ))),
+            guards: Rc::new(Vec::new()),
+            data: None,
+            data_ref,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Self {
+        *self.data_ref.borrow_mut() = self.data.take().map(Rc::new);
+        self
+    }
+
+    pub(crate) fn take_guards(&mut self) -> Vec<Box<Guard>> {
+        std::mem::replace(Rc::get_mut(&mut self.guards).unwrap(), Vec::new())
+    }
+}
+
+impl NewService for Route {
+    type Request = ServiceRequest;
+    type Response = ServiceResponse;
+    type Error = Error;
+    type InitError = ();
+    type Service = RouteService;
+    type Future = CreateRouteService;
+
+    fn new_service(&self, _: &()) -> Self::Future {
+        CreateRouteService {
+            fut: self.service.new_service(&()),
+            guards: self.guards.clone(),
         }
     }
 }
 
-impl<S: 'static> Route<S> {
-    #[inline]
-    pub(crate) fn check(&self, req: &HttpRequest<S>) -> bool {
-        let state = req.state();
-        for pred in &self.preds {
-            if !pred.check(req, state) {
+type RouteFuture =
+    Box<Future<Item = BoxedRouteService<ServiceRequest, ServiceResponse>, Error = ()>>;
+
+pub struct CreateRouteService {
+    fut: RouteFuture,
+    guards: Rc<Vec<Box<Guard>>>,
+}
+
+impl Future for CreateRouteService {
+    type Item = RouteService;
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.fut.poll()? {
+            Async::Ready(service) => Ok(Async::Ready(RouteService {
+                service,
+                guards: self.guards.clone(),
+            })),
+            Async::NotReady => Ok(Async::NotReady),
+        }
+    }
+}
+
+pub struct RouteService {
+    service: BoxedRouteService<ServiceRequest, ServiceResponse>,
+    guards: Rc<Vec<Box<Guard>>>,
+}
+
+impl RouteService {
+    pub fn check(&self, req: &mut ServiceRequest) -> bool {
+        for f in self.guards.iter() {
+            if !f.check(req.head()) {
                 return false;
             }
         }
         true
     }
+}
 
-    #[inline]
-    pub(crate) fn handle(&self, req: &HttpRequest<S>) -> AsyncResult<HttpResponse> {
-        self.handler.handle(req)
+impl Service for RouteService {
+    type Request = ServiceRequest;
+    type Response = ServiceResponse;
+    type Error = Error;
+    type Future = Either<
+        FutureResult<Self::Response, Self::Error>,
+        Box<Future<Item = Self::Response, Error = Self::Error>>,
+    >;
+
+    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        self.service.poll_ready()
     }
 
-    #[inline]
-    pub(crate) fn compose(
-        &self, req: HttpRequest<S>, mws: Rc<Vec<Box<Middleware<S>>>>,
-    ) -> AsyncResult<HttpResponse> {
-        AsyncResult::future(Box::new(Compose::new(req, mws, self.handler.clone())))
+    fn call(&mut self, req: ServiceRequest) -> Self::Future {
+        self.service.call(req)
     }
+}
 
-    /// Add match predicate to route.
+impl Route {
+    /// Add method guard to the route.
     ///
     /// ```rust
-    /// # extern crate actix_web;
     /// # use actix_web::*;
     /// # fn main() {
-    /// App::new().resource("/path", |r| {
-    ///     r.route()
-    ///         .filter(pred::Get())
-    ///         .filter(pred::Header("content-type", "text/plain"))
-    ///         .f(|req| HttpResponse::Ok())
-    /// })
-    /// #      .finish();
+    /// App::new().service(web::resource("/path").route(
+    ///     web::get()
+    ///         .method(http::Method::CONNECT)
+    ///         .guard(guard::Header("content-type", "text/plain"))
+    ///         .to(|req: HttpRequest| HttpResponse::Ok()))
+    /// );
     /// # }
     /// ```
-    pub fn filter<T: Predicate<S> + 'static>(&mut self, p: T) -> &mut Self {
-        self.preds.push(Box::new(p));
+    pub fn method(mut self, method: Method) -> Self {
+        Rc::get_mut(&mut self.guards)
+            .unwrap()
+            .push(Box::new(guard::Method(method)));
         self
     }
 
-    /// Set handler object. Usually call to this method is last call
-    /// during route configuration, so it does not return reference to self.
-    pub fn h<H: Handler<S>>(&mut self, handler: H) {
-        self.handler = InnerHandler::new(handler);
-    }
-
-    /// Set handler function. Usually call to this method is last call
-    /// during route configuration, so it does not return reference to self.
-    pub fn f<F, R>(&mut self, handler: F)
-    where
-        F: Fn(&HttpRequest<S>) -> R + 'static,
-        R: Responder + 'static,
-    {
-        self.handler = InnerHandler::new(handler);
-    }
-
-    /// Set async handler function.
-    pub fn a<H, R, F, E>(&mut self, handler: H)
-    where
-        H: Fn(&HttpRequest<S>) -> F + 'static,
-        F: Future<Item = R, Error = E> + 'static,
-        R: Responder + 'static,
-        E: Into<Error> + 'static,
-    {
-        self.handler = InnerHandler::async(handler);
-    }
-
-    /// Set handler function, use request extractor for parameters.
+    /// Add guard to the route.
     ///
     /// ```rust
-    /// # extern crate bytes;
-    /// # extern crate actix_web;
-    /// # extern crate futures;
+    /// # use actix_web::*;
+    /// # fn main() {
+    /// App::new().service(web::resource("/path").route(
+    ///     web::route()
+    ///         .guard(guard::Get())
+    ///         .guard(guard::Header("content-type", "text/plain"))
+    ///         .to(|req: HttpRequest| HttpResponse::Ok()))
+    /// );
+    /// # }
+    /// ```
+    pub fn guard<F: Guard + 'static>(mut self, f: F) -> Self {
+        Rc::get_mut(&mut self.guards).unwrap().push(Box::new(f));
+        self
+    }
+
+    /// Set handler function, use request extractors for parameters.
+    ///
+    /// ```rust
     /// #[macro_use] extern crate serde_derive;
-    /// use actix_web::{http, App, Path, Result};
+    /// use actix_web::{web, http, App};
     ///
     /// #[derive(Deserialize)]
     /// struct Info {
@@ -122,27 +197,24 @@ impl<S: 'static> Route<S> {
     /// }
     ///
     /// /// extract path info using serde
-    /// fn index(info: Path<Info>) -> Result<String> {
-    ///     Ok(format!("Welcome {}!", info.username))
+    /// fn index(info: web::Path<Info>) -> String {
+    ///     format!("Welcome {}!", info.username)
     /// }
     ///
     /// fn main() {
-    ///     let app = App::new().resource(
-    ///         "/{username}/index.html", // <- define path parameters
-    ///         |r| r.method(http::Method::GET).with(index),
-    ///     ); // <- use `with` extractor
+    ///     let app = App::new().service(
+    ///         web::resource("/{username}/index.html") // <- define path parameters
+    ///             .route(web::get().to(index))        // <- register handler
+    ///     );
     /// }
     /// ```
     ///
     /// It is possible to use multiple extractors for one handler function.
     ///
     /// ```rust
-    /// # extern crate bytes;
-    /// # extern crate actix_web;
-    /// # extern crate futures;
-    /// #[macro_use] extern crate serde_derive;
     /// # use std::collections::HashMap;
-    /// use actix_web::{http, App, Json, Path, Query, Result};
+    /// # use serde_derive::Deserialize;
+    /// use actix_web::{web, App};
     ///
     /// #[derive(Deserialize)]
     /// struct Info {
@@ -150,517 +222,280 @@ impl<S: 'static> Route<S> {
     /// }
     ///
     /// /// extract path info using serde
-    /// fn index(
-    ///     path: Path<Info>, query: Query<HashMap<String, String>>, body: Json<Info>,
-    /// ) -> Result<String> {
-    ///     Ok(format!("Welcome {}!", path.username))
+    /// fn index(path: web::Path<Info>, query: web::Query<HashMap<String, String>>, body: web::Json<Info>) -> String {
+    ///     format!("Welcome {}!", path.username)
     /// }
     ///
     /// fn main() {
-    ///     let app = App::new().resource(
-    ///         "/{username}/index.html", // <- define path parameters
-    ///         |r| r.method(http::Method::GET).with(index),
-    ///     ); // <- use `with` extractor
+    ///     let app = App::new().service(
+    ///         web::resource("/{username}/index.html") // <- define path parameters
+    ///             .route(web::get().to(index))
+    ///     );
     /// }
     /// ```
-    pub fn with<T, F, R>(&mut self, handler: F)
+    pub fn to<F, T, R>(mut self, handler: F) -> Route
     where
-        F: WithFactory<T, S, R> + 'static,
+        F: Factory<T, R> + 'static,
+        T: FromRequest + 'static,
         R: Responder + 'static,
-        T: FromRequest<S> + 'static,
     {
-        self.h(handler.create());
+        self.service = Box::new(RouteNewService::new(Extract::new(
+            self.data_ref.clone(),
+            Handler::new(handler),
+        )));
+        self
     }
 
-    /// Set handler function. Same as `.with()` but it allows to configure
-    /// extractor. Configuration closure accepts config objects as tuple.
+    /// Set async handler function, use request extractors for parameters.
+    /// This method has to be used if your handler function returns `impl Future<>`
     ///
     /// ```rust
-    /// # extern crate bytes;
-    /// # extern crate actix_web;
-    /// # extern crate futures;
+    /// # use futures::future::ok;
     /// #[macro_use] extern crate serde_derive;
-    /// use actix_web::{http, App, Path, Result};
+    /// use actix_web::{web, App, Error};
+    /// use futures::Future;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct Info {
+    ///     username: String,
+    /// }
+    ///
+    /// /// extract path info using serde
+    /// fn index(info: web::Path<Info>) -> impl Future<Item = &'static str, Error = Error> {
+    ///     ok("Hello World!")
+    /// }
+    ///
+    /// fn main() {
+    ///     let app = App::new().service(
+    ///         web::resource("/{username}/index.html") // <- define path parameters
+    ///             .route(web::get().to_async(index))  // <- register async handler
+    ///     );
+    /// }
+    /// ```
+    #[allow(clippy::wrong_self_convention)]
+    pub fn to_async<F, T, R>(mut self, handler: F) -> Self
+    where
+        F: AsyncFactory<T, R>,
+        T: FromRequest + 'static,
+        R: IntoFuture + 'static,
+        R::Item: Responder,
+        R::Error: Into<Error>,
+    {
+        self.service = Box::new(RouteNewService::new(Extract::new(
+            self.data_ref.clone(),
+            AsyncHandler::new(handler),
+        )));
+        self
+    }
+
+    /// Provide route specific data. This method allows to add extractor
+    /// configuration or specific state available via `RouteData<T>` extractor.
+    ///
+    /// ```rust
+    /// use actix_web::{web, App, FromRequest};
     ///
     /// /// extract text data from request
-    /// fn index(body: String) -> Result<String> {
-    ///     Ok(format!("Body {}!", body))
+    /// fn index(body: String) -> String {
+    ///     format!("Body {}!", body)
     /// }
     ///
     /// fn main() {
-    ///     let app = App::new().resource("/index.html", |r| {
-    ///         r.method(http::Method::GET)
-    ///                .with_config(index, |cfg| { // <- register handler
-    ///                   cfg.0.limit(4096);  // <- limit size of the payload
-    ///                 })
-    ///     });
+    ///     let app = App::new().service(
+    ///         web::resource("/index.html").route(
+    ///             web::get()
+    ///                // limit size of the payload
+    ///                .data(String::configure(|cfg| {
+    ///                    cfg.limit(4096)
+    ///                }))
+    ///                // register handler
+    ///                .to(index)
+    ///         ));
     /// }
     /// ```
-    pub fn with_config<T, F, R, C>(&mut self, handler: F, cfg_f: C)
-    where
-        F: WithFactory<T, S, R>,
-        R: Responder + 'static,
-        T: FromRequest<S> + 'static,
-        C: FnOnce(&mut T::Config),
-    {
-        let mut cfg = <T::Config as Default>::default();
-        cfg_f(&mut cfg);
-        self.h(handler.create_with_config(cfg));
-    }
-
-    /// Set async handler function, use request extractor for parameters.
-    /// Also this method needs to be used if your handler function returns
-    /// `impl Future<>`
-    ///
-    /// ```rust
-    /// # extern crate bytes;
-    /// # extern crate actix_web;
-    /// # extern crate futures;
-    /// #[macro_use] extern crate serde_derive;
-    /// use actix_web::{http, App, Error, Path};
-    /// use futures::Future;
-    ///
-    /// #[derive(Deserialize)]
-    /// struct Info {
-    ///     username: String,
-    /// }
-    ///
-    /// /// extract path info using serde
-    /// fn index(info: Path<Info>) -> Box<Future<Item = &'static str, Error = Error>> {
-    ///     unimplemented!()
-    /// }
-    ///
-    /// fn main() {
-    ///     let app = App::new().resource(
-    ///         "/{username}/index.html", // <- define path parameters
-    ///         |r| r.method(http::Method::GET).with_async(index),
-    ///     ); // <- use `with` extractor
-    /// }
-    /// ```
-    pub fn with_async<T, F, R, I, E>(&mut self, handler: F)
-    where
-        F: WithAsyncFactory<T, S, R, I, E>,
-        R: Future<Item = I, Error = E> + 'static,
-        I: Responder + 'static,
-        E: Into<Error> + 'static,
-        T: FromRequest<S> + 'static,
-    {
-        self.h(handler.create());
-    }
-
-    /// Set async handler function, use request extractor for parameters.
-    /// This method allows to configure extractor. Configuration closure
-    /// accepts config objects as tuple.
-    ///
-    /// ```rust
-    /// # extern crate bytes;
-    /// # extern crate actix_web;
-    /// # extern crate futures;
-    /// #[macro_use] extern crate serde_derive;
-    /// use actix_web::{http, App, Error, Form};
-    /// use futures::Future;
-    ///
-    /// #[derive(Deserialize)]
-    /// struct Info {
-    ///     username: String,
-    /// }
-    ///
-    /// /// extract path info using serde
-    /// fn index(info: Form<Info>) -> Box<Future<Item = &'static str, Error = Error>> {
-    ///     unimplemented!()
-    /// }
-    ///
-    /// fn main() {
-    ///     let app = App::new().resource(
-    ///         "/{username}/index.html", // <- define path parameters
-    ///         |r| r.method(http::Method::GET)
-    ///            .with_async_config(index, |cfg| {
-    ///                cfg.0.limit(4096);
-    ///            }),
-    ///     ); // <- use `with` extractor
-    /// }
-    /// ```
-    pub fn with_async_config<T, F, R, I, E, C>(&mut self, handler: F, cfg: C)
-    where
-        F: WithAsyncFactory<T, S, R, I, E>,
-        R: Future<Item = I, Error = E> + 'static,
-        I: Responder + 'static,
-        E: Into<Error> + 'static,
-        T: FromRequest<S> + 'static,
-        C: FnOnce(&mut T::Config),
-    {
-        let mut extractor_cfg = <T::Config as Default>::default();
-        cfg(&mut extractor_cfg);
-        self.h(handler.create_with_config(extractor_cfg));
-    }
-}
-
-/// `RouteHandler` wrapper. This struct is required because it needs to be
-/// shared for resource level middlewares.
-struct InnerHandler<S>(Rc<Box<RouteHandler<S>>>);
-
-impl<S: 'static> InnerHandler<S> {
-    #[inline]
-    fn new<H: Handler<S>>(h: H) -> Self {
-        InnerHandler(Rc::new(Box::new(WrapHandler::new(h))))
-    }
-
-    #[inline]
-    fn async<H, R, F, E>(h: H) -> Self
-    where
-        H: Fn(&HttpRequest<S>) -> F + 'static,
-        F: Future<Item = R, Error = E> + 'static,
-        R: Responder + 'static,
-        E: Into<Error> + 'static,
-    {
-        InnerHandler(Rc::new(Box::new(AsyncHandler::new(h))))
-    }
-
-    #[inline]
-    pub fn handle(&self, req: &HttpRequest<S>) -> AsyncResult<HttpResponse> {
-        self.0.handle(req)
-    }
-}
-
-impl<S> Clone for InnerHandler<S> {
-    #[inline]
-    fn clone(&self) -> Self {
-        InnerHandler(Rc::clone(&self.0))
-    }
-}
-
-/// Compose resource level middlewares with route handler.
-struct Compose<S: 'static> {
-    info: ComposeInfo<S>,
-    state: ComposeState<S>,
-}
-
-struct ComposeInfo<S: 'static> {
-    count: usize,
-    req: HttpRequest<S>,
-    mws: Rc<Vec<Box<Middleware<S>>>>,
-    handler: InnerHandler<S>,
-}
-
-enum ComposeState<S: 'static> {
-    Starting(StartMiddlewares<S>),
-    Handler(WaitingResponse<S>),
-    RunMiddlewares(RunMiddlewares<S>),
-    Finishing(FinishingMiddlewares<S>),
-    Completed(Response<S>),
-}
-
-impl<S: 'static> ComposeState<S> {
-    fn poll(&mut self, info: &mut ComposeInfo<S>) -> Option<ComposeState<S>> {
-        match *self {
-            ComposeState::Starting(ref mut state) => state.poll(info),
-            ComposeState::Handler(ref mut state) => state.poll(info),
-            ComposeState::RunMiddlewares(ref mut state) => state.poll(info),
-            ComposeState::Finishing(ref mut state) => state.poll(info),
-            ComposeState::Completed(_) => None,
+    pub fn data<T: 'static>(mut self, data: T) -> Self {
+        if self.data.is_none() {
+            self.data = Some(Extensions::new());
         }
+        self.data.as_mut().unwrap().insert(RouteData::new(data));
+        self
     }
 }
 
-impl<S: 'static> Compose<S> {
-    fn new(
-        req: HttpRequest<S>, mws: Rc<Vec<Box<Middleware<S>>>>, handler: InnerHandler<S>,
-    ) -> Self {
-        let mut info = ComposeInfo {
-            count: 0,
-            req,
-            mws,
-            handler,
-        };
-        let state = StartMiddlewares::init(&mut info);
+struct RouteNewService<T>
+where
+    T: NewService<Request = ServiceRequest, Error = (Error, ServiceRequest)>,
+{
+    service: T,
+}
 
-        Compose { state, info }
+impl<T> RouteNewService<T>
+where
+    T: NewService<
+        Request = ServiceRequest,
+        Response = ServiceResponse,
+        Error = (Error, ServiceRequest),
+    >,
+    T::Future: 'static,
+    T::Service: 'static,
+    <T::Service as Service>::Future: 'static,
+{
+    pub fn new(service: T) -> Self {
+        RouteNewService { service }
     }
 }
 
-impl<S> Future for Compose<S> {
-    type Item = HttpResponse;
+impl<T> NewService for RouteNewService<T>
+where
+    T: NewService<
+        Request = ServiceRequest,
+        Response = ServiceResponse,
+        Error = (Error, ServiceRequest),
+    >,
+    T::Future: 'static,
+    T::Service: 'static,
+    <T::Service as Service>::Future: 'static,
+{
+    type Request = ServiceRequest;
+    type Response = ServiceResponse;
     type Error = Error;
+    type InitError = ();
+    type Service = BoxedRouteService<ServiceRequest, Self::Response>;
+    type Future = Box<Future<Item = Self::Service, Error = Self::InitError>>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        loop {
-            if let ComposeState::Completed(ref mut resp) = self.state {
-                let resp = resp.resp.take().unwrap();
-                return Ok(Async::Ready(resp));
-            }
-            if let Some(state) = self.state.poll(&mut self.info) {
-                self.state = state;
-            } else {
-                return Ok(Async::NotReady);
-            }
+    fn new_service(&self, _: &()) -> Self::Future {
+        Box::new(
+            self.service
+                .new_service(&())
+                .map_err(|_| ())
+                .and_then(|service| {
+                    let service: BoxedRouteService<_, _> =
+                        Box::new(RouteServiceWrapper { service });
+                    Ok(service)
+                }),
+        )
+    }
+}
+
+struct RouteServiceWrapper<T: Service> {
+    service: T,
+}
+
+impl<T> Service for RouteServiceWrapper<T>
+where
+    T::Future: 'static,
+    T: Service<
+        Request = ServiceRequest,
+        Response = ServiceResponse,
+        Error = (Error, ServiceRequest),
+    >,
+{
+    type Request = ServiceRequest;
+    type Response = ServiceResponse;
+    type Error = Error;
+    type Future = Either<
+        FutureResult<Self::Response, Self::Error>,
+        Box<Future<Item = Self::Response, Error = Self::Error>>,
+    >;
+
+    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        self.service.poll_ready().map_err(|(e, _)| e)
+    }
+
+    fn call(&mut self, req: ServiceRequest) -> Self::Future {
+        let mut fut = self.service.call(req);
+        match fut.poll() {
+            Ok(Async::Ready(res)) => Either::A(ok(res)),
+            Err((e, req)) => Either::A(ok(req.error_response(e))),
+            Ok(Async::NotReady) => Either::B(Box::new(fut.then(|res| match res {
+                Ok(res) => Ok(res),
+                Err((err, req)) => Ok(req.error_response(err)),
+            }))),
         }
     }
 }
 
-/// Middlewares start executor
-struct StartMiddlewares<S> {
-    fut: Option<Fut>,
-    _s: PhantomData<S>,
-}
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
 
-type Fut = Box<Future<Item = Option<HttpResponse>, Error = Error>>;
+    use bytes::Bytes;
+    use futures::Future;
+    use serde_derive::Serialize;
+    use tokio_timer::sleep;
 
-impl<S: 'static> StartMiddlewares<S> {
-    fn init(info: &mut ComposeInfo<S>) -> ComposeState<S> {
-        let len = info.mws.len();
+    use crate::http::{Method, StatusCode};
+    use crate::test::{call_service, init_service, read_body, TestRequest};
+    use crate::{error, web, App, HttpResponse};
 
-        loop {
-            if info.count == len {
-                let reply = info.handler.handle(&info.req);
-                return WaitingResponse::init(info, reply);
-            } else {
-                let result = info.mws[info.count].start(&info.req);
-                match result {
-                    Ok(MiddlewareStarted::Done) => info.count += 1,
-                    Ok(MiddlewareStarted::Response(resp)) => {
-                        return RunMiddlewares::init(info, resp);
-                    }
-                    Ok(MiddlewareStarted::Future(fut)) => {
-                        return ComposeState::Starting(StartMiddlewares {
-                            fut: Some(fut),
-                            _s: PhantomData,
-                        });
-                    }
-                    Err(err) => {
-                        return RunMiddlewares::init(info, err.into());
-                    }
-                }
-            }
-        }
+    #[derive(Serialize, PartialEq, Debug)]
+    struct MyObject {
+        name: String,
     }
 
-    fn poll(&mut self, info: &mut ComposeInfo<S>) -> Option<ComposeState<S>> {
-        let len = info.mws.len();
+    #[test]
+    fn test_route() {
+        let mut srv = init_service(
+            App::new()
+                .service(
+                    web::resource("/test")
+                        .route(web::get().to(|| HttpResponse::Ok()))
+                        .route(web::put().to(|| {
+                            Err::<HttpResponse, _>(error::ErrorBadRequest("err"))
+                        }))
+                        .route(web::post().to_async(|| {
+                            sleep(Duration::from_millis(100))
+                                .then(|_| HttpResponse::Created())
+                        }))
+                        .route(web::delete().to_async(|| {
+                            sleep(Duration::from_millis(100)).then(|_| {
+                                Err::<HttpResponse, _>(error::ErrorBadRequest("err"))
+                            })
+                        })),
+                )
+                .service(web::resource("/json").route(web::get().to_async(|| {
+                    sleep(Duration::from_millis(25)).then(|_| {
+                        Ok::<_, crate::Error>(web::Json(MyObject {
+                            name: "test".to_string(),
+                        }))
+                    })
+                }))),
+        );
 
-        'outer: loop {
-            match self.fut.as_mut().unwrap().poll() {
-                Ok(Async::NotReady) => {
-                    return None;
-                }
-                Ok(Async::Ready(resp)) => {
-                    info.count += 1;
-                    if let Some(resp) = resp {
-                        return Some(RunMiddlewares::init(info, resp));
-                    }
-                    loop {
-                        if info.count == len {
-                            let reply = info.handler.handle(&info.req);
-                            return Some(WaitingResponse::init(info, reply));
-                        } else {
-                            let result = info.mws[info.count].start(&info.req);
-                            match result {
-                                Ok(MiddlewareStarted::Done) => info.count += 1,
-                                Ok(MiddlewareStarted::Response(resp)) => {
-                                    return Some(RunMiddlewares::init(info, resp));
-                                }
-                                Ok(MiddlewareStarted::Future(fut)) => {
-                                    self.fut = Some(fut);
-                                    continue 'outer;
-                                }
-                                Err(err) => {
-                                    return Some(RunMiddlewares::init(info, err.into()));
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    return Some(RunMiddlewares::init(info, err.into()));
-                }
-            }
-        }
-    }
-}
+        let req = TestRequest::with_uri("/test")
+            .method(Method::GET)
+            .to_request();
+        let resp = call_service(&mut srv, req);
+        assert_eq!(resp.status(), StatusCode::OK);
 
-type HandlerFuture = Future<Item = HttpResponse, Error = Error>;
+        let req = TestRequest::with_uri("/test")
+            .method(Method::POST)
+            .to_request();
+        let resp = call_service(&mut srv, req);
+        assert_eq!(resp.status(), StatusCode::CREATED);
 
-// waiting for response
-struct WaitingResponse<S> {
-    fut: Box<HandlerFuture>,
-    _s: PhantomData<S>,
-}
+        let req = TestRequest::with_uri("/test")
+            .method(Method::PUT)
+            .to_request();
+        let resp = call_service(&mut srv, req);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-impl<S: 'static> WaitingResponse<S> {
-    #[inline]
-    fn init(
-        info: &mut ComposeInfo<S>, reply: AsyncResult<HttpResponse>,
-    ) -> ComposeState<S> {
-        match reply.into() {
-            AsyncResultItem::Ok(resp) => RunMiddlewares::init(info, resp),
-            AsyncResultItem::Err(err) => RunMiddlewares::init(info, err.into()),
-            AsyncResultItem::Future(fut) => ComposeState::Handler(WaitingResponse {
-                fut,
-                _s: PhantomData,
-            }),
-        }
-    }
+        let req = TestRequest::with_uri("/test")
+            .method(Method::DELETE)
+            .to_request();
+        let resp = call_service(&mut srv, req);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    fn poll(&mut self, info: &mut ComposeInfo<S>) -> Option<ComposeState<S>> {
-        match self.fut.poll() {
-            Ok(Async::NotReady) => None,
-            Ok(Async::Ready(resp)) => Some(RunMiddlewares::init(info, resp)),
-            Err(err) => Some(RunMiddlewares::init(info, err.into())),
-        }
-    }
-}
+        let req = TestRequest::with_uri("/test")
+            .method(Method::HEAD)
+            .to_request();
+        let resp = call_service(&mut srv, req);
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 
-/// Middlewares response executor
-struct RunMiddlewares<S> {
-    curr: usize,
-    fut: Option<Box<Future<Item = HttpResponse, Error = Error>>>,
-    _s: PhantomData<S>,
-}
+        let req = TestRequest::with_uri("/json").to_request();
+        let resp = call_service(&mut srv, req);
+        assert_eq!(resp.status(), StatusCode::OK);
 
-impl<S: 'static> RunMiddlewares<S> {
-    fn init(info: &mut ComposeInfo<S>, mut resp: HttpResponse) -> ComposeState<S> {
-        let mut curr = 0;
-        let len = info.mws.len();
-
-        loop {
-            let state = info.mws[curr].response(&info.req, resp);
-            resp = match state {
-                Err(err) => {
-                    info.count = curr + 1;
-                    return FinishingMiddlewares::init(info, err.into());
-                }
-                Ok(MiddlewareResponse::Done(r)) => {
-                    curr += 1;
-                    if curr == len {
-                        return FinishingMiddlewares::init(info, r);
-                    } else {
-                        r
-                    }
-                }
-                Ok(MiddlewareResponse::Future(fut)) => {
-                    return ComposeState::RunMiddlewares(RunMiddlewares {
-                        curr,
-                        fut: Some(fut),
-                        _s: PhantomData,
-                    });
-                }
-            };
-        }
-    }
-
-    fn poll(&mut self, info: &mut ComposeInfo<S>) -> Option<ComposeState<S>> {
-        let len = info.mws.len();
-
-        loop {
-            // poll latest fut
-            let mut resp = match self.fut.as_mut().unwrap().poll() {
-                Ok(Async::NotReady) => return None,
-                Ok(Async::Ready(resp)) => {
-                    self.curr += 1;
-                    resp
-                }
-                Err(err) => return Some(FinishingMiddlewares::init(info, err.into())),
-            };
-
-            loop {
-                if self.curr == len {
-                    return Some(FinishingMiddlewares::init(info, resp));
-                } else {
-                    let state = info.mws[self.curr].response(&info.req, resp);
-                    match state {
-                        Err(err) => {
-                            return Some(FinishingMiddlewares::init(info, err.into()))
-                        }
-                        Ok(MiddlewareResponse::Done(r)) => {
-                            self.curr += 1;
-                            resp = r
-                        }
-                        Ok(MiddlewareResponse::Future(fut)) => {
-                            self.fut = Some(fut);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Middlewares start executor
-struct FinishingMiddlewares<S> {
-    resp: Option<HttpResponse>,
-    fut: Option<Box<Future<Item = (), Error = Error>>>,
-    _s: PhantomData<S>,
-}
-
-impl<S: 'static> FinishingMiddlewares<S> {
-    fn init(info: &mut ComposeInfo<S>, resp: HttpResponse) -> ComposeState<S> {
-        if info.count == 0 {
-            Response::init(resp)
-        } else {
-            let mut state = FinishingMiddlewares {
-                resp: Some(resp),
-                fut: None,
-                _s: PhantomData,
-            };
-            if let Some(st) = state.poll(info) {
-                st
-            } else {
-                ComposeState::Finishing(state)
-            }
-        }
-    }
-
-    fn poll(&mut self, info: &mut ComposeInfo<S>) -> Option<ComposeState<S>> {
-        loop {
-            // poll latest fut
-            let not_ready = if let Some(ref mut fut) = self.fut {
-                match fut.poll() {
-                    Ok(Async::NotReady) => true,
-                    Ok(Async::Ready(())) => false,
-                    Err(err) => {
-                        error!("Middleware finish error: {}", err);
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-            if not_ready {
-                return None;
-            }
-            self.fut = None;
-            if info.count == 0 {
-                return Some(Response::init(self.resp.take().unwrap()));
-            }
-
-            info.count -= 1;
-
-            let state = info.mws[info.count as usize]
-                .finish(&info.req, self.resp.as_ref().unwrap());
-            match state {
-                MiddlewareFinished::Done => {
-                    if info.count == 0 {
-                        return Some(Response::init(self.resp.take().unwrap()));
-                    }
-                }
-                MiddlewareFinished::Future(fut) => {
-                    self.fut = Some(fut);
-                }
-            }
-        }
-    }
-}
-
-struct Response<S> {
-    resp: Option<HttpResponse>,
-    _s: PhantomData<S>,
-}
-
-impl<S: 'static> Response<S> {
-    fn init(resp: HttpResponse) -> ComposeState<S> {
-        ComposeState::Completed(Response {
-            resp: Some(resp),
-            _s: PhantomData,
-        })
+        let body = read_body(resp);
+        assert_eq!(body, Bytes::from_static(b"{\"name\":\"test\"}"));
     }
 }
