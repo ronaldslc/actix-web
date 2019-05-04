@@ -436,7 +436,6 @@ impl BoxedResponsePool {
             head.status = status;
             head.headers.clear();
             head.flags = Flags::empty();
-            head.extensions.get_mut().clear();
             BoxedResponseHead { head: Some(head) }
         } else {
             BoxedResponseHead {
