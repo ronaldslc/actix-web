@@ -81,13 +81,6 @@ pub enum CorsError {
         fmt = "The request header `Access-Control-Request-Headers`  has an invalid value"
     )]
     BadRequestHeaders,
-    /// The request header `Access-Control-Request-Headers`  is required but is
-    /// missing.
-    #[display(
-        fmt = "The request header `Access-Control-Request-Headers`  is required but is
-                     missing"
-    )]
-    MissingRequestHeaders,
     /// Origin is not allowed to make this request
     #[display(fmt = "Origin is not allowed to make this request")]
     OriginNotAllowed,
@@ -661,15 +654,18 @@ impl Inner {
                                 Err(_) => return Err(CorsError::BadRequestHeaders),
                             };
                         }
-
-                        if !hdrs.is_empty() && !hdrs.is_subset(allowed_headers) {
-                            return Err(CorsError::HeadersNotAllowed);
+                        // `Access-Control-Request-Headers` must contain 1 or more
+                        // `field-name`.
+                        if !hdrs.is_empty() {
+                            if !hdrs.is_subset(allowed_headers) {
+                                return Err(CorsError::HeadersNotAllowed);
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
                     }
                     Err(CorsError::BadRequestHeaders)
                 } else {
-                    Err(CorsError::MissingRequestHeaders)
+                    return Ok(());
                 }
             }
         }
@@ -809,14 +805,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use actix_service::{FnService, Transform};
+    use actix_service::{IntoService, Transform};
 
     use super::*;
     use crate::test::{self, block_on, TestRequest};
 
     impl Cors {
-        fn finish<S, B>(self, srv: S) -> CorsMiddleware<S>
+        fn finish<F, S, B>(self, srv: F) -> CorsMiddleware<S>
         where
+            F: IntoService<S>,
             S: Service<
                     Request = ServiceRequest,
                     Response = ServiceResponse<B>,
@@ -826,7 +823,8 @@ mod tests {
             B: 'static,
         {
             block_on(
-                IntoTransform::<CorsFactory, S>::into_transform(self).new_transform(srv),
+                IntoTransform::<CorsFactory, S>::into_transform(self)
+                    .new_transform(srv.into_service()),
             )
             .unwrap()
         }
@@ -874,6 +872,7 @@ mod tests {
 
         let req = TestRequest::with_header("Origin", "https://www.example.com")
             .method(Method::OPTIONS)
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "X-Not-Allowed")
             .to_srv_request();
 
         assert!(cors.inner.validate_allowed_method(req.head()).is_err());
@@ -887,7 +886,7 @@ mod tests {
             .to_srv_request();
 
         assert!(cors.inner.validate_allowed_method(req.head()).is_err());
-        assert!(cors.inner.validate_allowed_headers(req.head()).is_err());
+        assert!(cors.inner.validate_allowed_headers(req.head()).is_ok());
 
         let req = TestRequest::with_header("Origin", "https://www.example.com")
             .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
@@ -1066,11 +1065,11 @@ mod tests {
             .allowed_headers(exposed_headers.clone())
             .expose_headers(exposed_headers.clone())
             .allowed_header(header::CONTENT_TYPE)
-            .finish(FnService::new(move |req: ServiceRequest| {
+            .finish(|req: ServiceRequest| {
                 req.into_response(
                     HttpResponse::Ok().header(header::VARY, "Accept").finish(),
                 )
-            }));
+            });
         let req = TestRequest::with_header("Origin", "https://www.example.com")
             .method(Method::OPTIONS)
             .to_srv_request();

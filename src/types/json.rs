@@ -1,6 +1,6 @@
 //! Json extractor/responder
 
-use std::rc::Rc;
+use std::sync::Arc;
 use std::{fmt, ops};
 
 use bytes::BytesMut;
@@ -168,15 +168,15 @@ impl<T> FromRequest for Json<T>
 where
     T: DeserializeOwned + 'static,
 {
-    type Config = JsonConfig;
     type Error = Error;
     type Future = Box<Future<Item = Self, Error = Error>>;
+    type Config = JsonConfig;
 
     #[inline]
     fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
         let req2 = req.clone();
         let (limit, err) = req
-            .route_data::<JsonConfig>()
+            .app_data::<Self::Config>()
             .map(|c| (c.limit, c.ehandler.clone()))
             .unwrap_or((32768, None));
 
@@ -220,24 +220,23 @@ where
 ///
 /// fn main() {
 ///     let app = App::new().service(
-///         web::resource("/index.html").route(
-///             web::post().data(
-///                 // change json extractor configuration
-///                 web::Json::<Info>::configure(|cfg| {
-///                     cfg.limit(4096)
-///                        .error_handler(|err, req| {  // <- create custom error response
-///                             error::InternalError::from_response(
-///                                 err, HttpResponse::Conflict().finish()).into()
-///                        })
-///                 }))
-///                 .to(index))
+///         web::resource("/index.html").data(
+///             // change json extractor configuration
+///             web::Json::<Info>::configure(|cfg| {
+///                 cfg.limit(4096)
+///                    .error_handler(|err, req| {  // <- create custom error response
+///                         error::InternalError::from_response(
+///                             err, HttpResponse::Conflict().finish()).into()
+///                    })
+///             }))
+///             .route(web::post().to(index))
 ///     );
 /// }
 /// ```
 #[derive(Clone)]
 pub struct JsonConfig {
     limit: usize,
-    ehandler: Option<Rc<Fn(JsonPayloadError, &HttpRequest) -> Error>>,
+    ehandler: Option<Arc<dyn Fn(JsonPayloadError, &HttpRequest) -> Error + Send + Sync>>,
 }
 
 impl JsonConfig {
@@ -250,9 +249,9 @@ impl JsonConfig {
     /// Set custom error handler
     pub fn error_handler<F>(mut self, f: F) -> Self
     where
-        F: Fn(JsonPayloadError, &HttpRequest) -> Error + 'static,
+        F: Fn(JsonPayloadError, &HttpRequest) -> Error + Send + Sync + 'static,
     {
-        self.ehandler = Some(Rc::new(f));
+        self.ehandler = Some(Arc::new(f));
         self
     }
 }
@@ -431,7 +430,7 @@ mod tests {
                 header::HeaderValue::from_static("16"),
             )
             .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-            .route_data(JsonConfig::default().limit(10).error_handler(|err, _| {
+            .data(JsonConfig::default().limit(10).error_handler(|err, _| {
                 let msg = MyObject {
                     name: "invalid request".to_string(),
                 };
@@ -483,7 +482,7 @@ mod tests {
                 header::HeaderValue::from_static("16"),
             )
             .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-            .route_data(JsonConfig::default().limit(10))
+            .data(JsonConfig::default().limit(10))
             .to_http_parts();
 
         let s = block_on(Json::<MyObject>::from_request(&req, &mut pl));
@@ -500,7 +499,7 @@ mod tests {
                 header::HeaderValue::from_static("16"),
             )
             .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-            .route_data(
+            .data(
                 JsonConfig::default()
                     .limit(10)
                     .error_handler(|_, _| JsonPayloadError::ContentType.into()),

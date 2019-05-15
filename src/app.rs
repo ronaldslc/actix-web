@@ -4,7 +4,6 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use actix_http::body::{Body, MessageBody};
-use actix_server_config::ServerConfig;
 use actix_service::boxed::{self, BoxedNewService};
 use actix_service::{
     apply_transform, IntoNewService, IntoTransform, NewService, Transform,
@@ -59,6 +58,7 @@ impl<T, B> App<T, B>
 where
     B: MessageBody,
     T: NewService<
+        Config = (),
         Request = ServiceRequest,
         Response = ServiceResponse<B>,
         Error = Error,
@@ -95,21 +95,8 @@ where
     ///                 web::get().to(index)));
     /// }
     /// ```
-    pub fn data<U: Into<Data<U>> + 'static>(mut self, data: U) -> Self {
-        self.data.push(Box::new(data.into()));
-        self
-    }
-
-    /// Set application data factory. This function is
-    /// similar to `.data()` but it accepts data factory. Data object get
-    /// constructed asynchronously during application initialization.
-    pub fn data_factory<F, R>(mut self, data: F) -> Self
-    where
-        F: Fn() -> R + 'static,
-        R: IntoFuture + 'static,
-        R::Error: std::fmt::Debug,
-    {
-        self.data.push(Box::new(data));
+    pub fn data<U: 'static>(mut self, data: U) -> Self {
+        self.data.push(Box::new(Data::new(data)));
         self
     }
 
@@ -141,7 +128,7 @@ where
     /// ```
     pub fn configure<F>(mut self, f: F) -> Self
     where
-        F: Fn(&mut ServiceConfig),
+        F: FnOnce(&mut ServiceConfig),
     {
         let mut cfg = ServiceConfig::new();
         f(&mut cfg);
@@ -247,6 +234,7 @@ where
     where
         F: IntoNewService<U>,
         U: NewService<
+                Config = (),
                 Request = ServiceRequest,
                 Response = ServiceResponse,
                 Error = Error,
@@ -332,6 +320,7 @@ where
         mw: F,
     ) -> App<
         impl NewService<
+            Config = (),
             Request = ServiceRequest,
             Response = ServiceResponse<B1>,
             Error = Error,
@@ -397,6 +386,7 @@ where
         mw: F,
     ) -> App<
         impl NewService<
+            Config = (),
             Request = ServiceRequest,
             Response = ServiceResponse<B1>,
             Error = Error,
@@ -413,10 +403,11 @@ where
     }
 }
 
-impl<T, B> IntoNewService<AppInit<T, B>, ServerConfig> for App<T, B>
+impl<T, B> IntoNewService<AppInit<T, B>> for App<T, B>
 where
     B: MessageBody,
     T: NewService<
+        Config = (),
         Request = ServiceRequest,
         Response = ServiceResponse<B>,
         Error = Error,
@@ -425,9 +416,9 @@ where
 {
     fn into_new_service(self) -> AppInit<T, B> {
         AppInit {
-            data: self.data,
+            data: Rc::new(self.data),
             endpoint: self.endpoint,
-            services: RefCell::new(self.services),
+            services: Rc::new(RefCell::new(self.services)),
             external: RefCell::new(self.external),
             default: self.default,
             factory_ref: self.factory_ref,
@@ -493,24 +484,24 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
-    #[test]
-    fn test_data_factory() {
-        let mut srv =
-            init_service(App::new().data_factory(|| Ok::<_, ()>(10usize)).service(
-                web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
-            ));
-        let req = TestRequest::default().to_request();
-        let resp = block_on(srv.call(req)).unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+    // #[test]
+    // fn test_data_factory() {
+    //     let mut srv =
+    //         init_service(App::new().data_factory(|| Ok::<_, ()>(10usize)).service(
+    //             web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
+    //         ));
+    //     let req = TestRequest::default().to_request();
+    //     let resp = block_on(srv.call(req)).unwrap();
+    //     assert_eq!(resp.status(), StatusCode::OK);
 
-        let mut srv =
-            init_service(App::new().data_factory(|| Ok::<_, ()>(10u32)).service(
-                web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
-            ));
-        let req = TestRequest::default().to_request();
-        let resp = block_on(srv.call(req)).unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
+    //     let mut srv =
+    //         init_service(App::new().data_factory(|| Ok::<_, ()>(10u32)).service(
+    //             web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
+    //         ));
+    //     let req = TestRequest::default().to_request();
+    //     let resp = block_on(srv.call(req)).unwrap();
+    //     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // }
 
     fn md<S, B>(
         req: ServiceRequest,

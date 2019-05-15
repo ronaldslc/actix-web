@@ -1,9 +1,8 @@
-use std::cell::RefCell;
+use std::convert::Infallible;
 use std::marker::PhantomData;
-use std::rc::Rc;
 
-use actix_http::{Error, Extensions, Payload, Response};
-use actix_service::{NewService, Service, Void};
+use actix_http::{Error, Payload, Response};
+use actix_service::{NewService, Service};
 use futures::future::{ok, FutureResult};
 use futures::{try_ready, Async, Future, IntoFuture, Poll};
 
@@ -73,7 +72,7 @@ where
 {
     type Request = (T, HttpRequest);
     type Response = ServiceResponse;
-    type Error = Void;
+    type Error = Infallible;
     type Future = HandlerServiceResponse<<R::Future as IntoFuture>::Future>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
@@ -100,7 +99,7 @@ where
     T::Error: Into<Error>,
 {
     type Item = ServiceResponse;
-    type Error = Void;
+    type Error = Infallible;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         match self.fut.poll() {
@@ -193,7 +192,7 @@ where
 {
     type Request = (T, HttpRequest);
     type Response = ServiceResponse;
-    type Error = Void;
+    type Error = Infallible;
     type Future = AsyncHandlerServiceResponse<R::Future>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
@@ -227,7 +226,7 @@ where
     T::Error: Into<Error>,
 {
     type Item = ServiceResponse;
-    type Error = Void;
+    type Error = Infallible;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         if let Some(ref mut fut) = self.fut2 {
@@ -267,15 +266,13 @@ where
 
 /// Extract arguments from request
 pub struct Extract<T: FromRequest, S> {
-    config: Rc<RefCell<Option<Rc<Extensions>>>>,
     service: S,
     _t: PhantomData<T>,
 }
 
 impl<T: FromRequest, S> Extract<T, S> {
-    pub fn new(config: Rc<RefCell<Option<Rc<Extensions>>>>, service: S) -> Self {
+    pub fn new(service: S) -> Self {
         Extract {
-            config,
             service,
             _t: PhantomData,
         }
@@ -284,9 +281,13 @@ impl<T: FromRequest, S> Extract<T, S> {
 
 impl<T: FromRequest, S> NewService for Extract<T, S>
 where
-    S: Service<Request = (T, HttpRequest), Response = ServiceResponse, Error = Void>
-        + Clone,
+    S: Service<
+            Request = (T, HttpRequest),
+            Response = ServiceResponse,
+            Error = Infallible,
+        > + Clone,
 {
+    type Config = ();
     type Request = ServiceRequest;
     type Response = ServiceResponse;
     type Error = (Error, ServiceRequest);
@@ -297,22 +298,23 @@ where
     fn new_service(&self, _: &()) -> Self::Future {
         ok(ExtractService {
             _t: PhantomData,
-            config: self.config.borrow().clone(),
             service: self.service.clone(),
         })
     }
 }
 
 pub struct ExtractService<T: FromRequest, S> {
-    config: Option<Rc<Extensions>>,
     service: S,
     _t: PhantomData<T>,
 }
 
 impl<T: FromRequest, S> Service for ExtractService<T, S>
 where
-    S: Service<Request = (T, HttpRequest), Response = ServiceResponse, Error = Void>
-        + Clone,
+    S: Service<
+            Request = (T, HttpRequest),
+            Response = ServiceResponse,
+            Error = Infallible,
+        > + Clone,
 {
     type Request = ServiceRequest;
     type Response = ServiceResponse;
@@ -324,8 +326,7 @@ where
     }
 
     fn call(&mut self, req: ServiceRequest) -> Self::Future {
-        let (mut req, mut payload) = req.into_parts();
-        req.set_route_data(self.config.clone());
+        let (req, mut payload) = req.into_parts();
         let fut = T::from_request(&req, &mut payload).into_future();
 
         ExtractResponse {
@@ -346,7 +347,11 @@ pub struct ExtractResponse<T: FromRequest, S: Service> {
 
 impl<T: FromRequest, S> Future for ExtractResponse<T, S>
 where
-    S: Service<Request = (T, HttpRequest), Response = ServiceResponse, Error = Void>,
+    S: Service<
+        Request = (T, HttpRequest),
+        Response = ServiceResponse,
+        Error = Infallible,
+    >,
 {
     type Item = ServiceResponse;
     type Error = (Error, ServiceRequest);

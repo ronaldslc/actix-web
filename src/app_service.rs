@@ -2,16 +2,16 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use actix_http::{Request, Response};
+use actix_http::{Extensions, Request, Response};
 use actix_router::{Path, ResourceDef, ResourceInfo, Router, Url};
 use actix_server_config::ServerConfig;
 use actix_service::boxed::{self, BoxedNewService, BoxedService};
-use actix_service::{fn_service, NewService, Service};
+use actix_service::{service_fn, NewService, Service};
 use futures::future::{ok, Either, FutureResult};
 use futures::{Async, Future, Poll};
 
 use crate::config::{AppConfig, AppService};
-use crate::data::{DataFactory, DataFactoryResult};
+use crate::data::DataFactory;
 use crate::error::Error;
 use crate::guard::Guard;
 use crate::request::{HttpRequest, HttpRequestPool};
@@ -31,6 +31,7 @@ type BoxedResponse = Either<
 pub struct AppInit<T, B>
 where
     T: NewService<
+        Config = (),
         Request = ServiceRequest,
         Response = ServiceResponse<B>,
         Error = Error,
@@ -38,23 +39,25 @@ where
     >,
 {
     pub(crate) endpoint: T,
-    pub(crate) data: Vec<Box<DataFactory>>,
+    pub(crate) data: Rc<Vec<Box<DataFactory>>>,
     pub(crate) config: RefCell<AppConfig>,
-    pub(crate) services: RefCell<Vec<Box<ServiceFactory>>>,
+    pub(crate) services: Rc<RefCell<Vec<Box<ServiceFactory>>>>,
     pub(crate) default: Option<Rc<HttpNewService>>,
     pub(crate) factory_ref: Rc<RefCell<Option<AppRoutingFactory>>>,
     pub(crate) external: RefCell<Vec<ResourceDef>>,
 }
 
-impl<T, B> NewService<ServerConfig> for AppInit<T, B>
+impl<T, B> NewService for AppInit<T, B>
 where
     T: NewService<
+        Config = (),
         Request = ServiceRequest,
         Response = ServiceResponse<B>,
         Error = Error,
         InitError = (),
     >,
 {
+    type Config = ServerConfig;
     type Request = Request;
     type Response = ServiceResponse<B>;
     type Error = T::Error;
@@ -65,11 +68,12 @@ where
     fn new_service(&self, cfg: &ServerConfig) -> Self::Future {
         // update resource default service
         let default = self.default.clone().unwrap_or_else(|| {
-            Rc::new(boxed::new_service(fn_service(|req: ServiceRequest| {
+            Rc::new(boxed::new_service(service_fn(|req: ServiceRequest| {
                 Ok(req.into_response(Response::NotFound().finish()))
             })))
         });
 
+        // App config
         {
             let mut c = self.config.borrow_mut();
             let loc_cfg = Rc::get_mut(&mut c.0).unwrap();
@@ -77,7 +81,11 @@ where
             loc_cfg.addr = cfg.local_addr();
         }
 
-        let mut config = AppService::new(self.config.borrow().clone(), default.clone());
+        let mut config = AppService::new(
+            self.config.borrow().clone(),
+            default.clone(),
+            self.data.clone(),
+        );
 
         // register services
         std::mem::replace(&mut *self.services.borrow_mut(), Vec::new())
@@ -86,12 +94,13 @@ where
 
         let mut rmap = ResourceMap::new(ResourceDef::new(""));
 
+        let (config, services) = config.into_services();
+
         // complete pipeline creation
         *self.factory_ref.borrow_mut() = Some(AppRoutingFactory {
             default,
             services: Rc::new(
-                config
-                    .into_services()
+                services
                     .into_iter()
                     .map(|(mut rdef, srv, guards, nested)| {
                         rmap.add(&mut rdef, nested);
@@ -110,11 +119,17 @@ where
         let rmap = Rc::new(rmap);
         rmap.finish(rmap.clone());
 
+        // create app data container
+        let mut data = Extensions::new();
+        for f in self.data.iter() {
+            f.create(&mut data);
+        }
+
         AppInitResult {
             endpoint: None,
             endpoint_fut: self.endpoint.new_service(&()),
-            data: self.data.iter().map(|s| s.construct()).collect(),
-            config: self.config.borrow().clone(),
+            data: Rc::new(data),
+            config,
             rmap,
             _t: PhantomData,
         }
@@ -128,14 +143,15 @@ where
     endpoint: Option<T::Service>,
     endpoint_fut: T::Future,
     rmap: Rc<ResourceMap>,
-    data: Vec<Box<DataFactoryResult>>,
     config: AppConfig,
+    data: Rc<Extensions>,
     _t: PhantomData<B>,
 }
 
 impl<T, B> Future for AppInitResult<T, B>
 where
     T: NewService<
+        Config = (),
         Request = ServiceRequest,
         Response = ServiceResponse<B>,
         Error = Error,
@@ -146,27 +162,18 @@ where
     type Error = T::InitError;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let mut idx = 0;
-        let mut extensions = self.config.0.extensions.borrow_mut();
-        while idx < self.data.len() {
-            if let Async::Ready(_) = self.data[idx].poll_result(&mut extensions)? {
-                self.data.remove(idx);
-            } else {
-                idx += 1;
-            }
-        }
-
         if self.endpoint.is_none() {
             if let Async::Ready(srv) = self.endpoint_fut.poll()? {
                 self.endpoint = Some(srv);
             }
         }
 
-        if self.endpoint.is_some() && self.data.is_empty() {
+        if self.endpoint.is_some() {
             Ok(Async::Ready(AppInitService {
                 service: self.endpoint.take().unwrap(),
                 rmap: self.rmap.clone(),
                 config: self.config.clone(),
+                data: self.data.clone(),
                 pool: HttpRequestPool::create(),
             }))
         } else {
@@ -183,6 +190,7 @@ where
     service: T,
     rmap: Rc<ResourceMap>,
     config: AppConfig,
+    data: Rc<Extensions>,
     pool: &'static HttpRequestPool,
 }
 
@@ -207,6 +215,7 @@ where
             inner.path.get_mut().update(&head.uri);
             inner.path.reset();
             inner.head = head;
+            inner.app_data = self.data.clone();
             req
         } else {
             HttpRequest::new(
@@ -214,6 +223,7 @@ where
                 head,
                 self.rmap.clone(),
                 self.config.clone(),
+                self.data.clone(),
                 self.pool,
             )
         };
@@ -227,6 +237,7 @@ pub struct AppRoutingFactory {
 }
 
 impl NewService for AppRoutingFactory {
+    type Config = ();
     type Request = ServiceRequest;
     type Response = ServiceResponse;
     type Error = Error;
@@ -385,6 +396,7 @@ impl AppEntry {
 }
 
 impl NewService for AppEntry {
+    type Config = ();
     type Request = ServiceRequest;
     type Response = ServiceResponse;
     type Error = Error;

@@ -1,6 +1,19 @@
 # Changes
 
-## [0.1.5] - 2019-05-xx
+## [0.2.0] - 2019-05-12
+
+### Changed
+
+* Update actix-service to 0.4
+
+* Expect and upgrade services accept `ServerConfig` config.
+
+### Deleted
+
+* `OneRequest` service
+
+
+## [0.1.5] - 2019-05-04
 
 ### Fixed
 

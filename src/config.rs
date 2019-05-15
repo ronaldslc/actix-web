@@ -1,11 +1,9 @@
-use std::cell::{Ref, RefCell};
 use std::net::SocketAddr;
 use std::rc::Rc;
 
 use actix_http::Extensions;
 use actix_router::ResourceDef;
 use actix_service::{boxed, IntoNewService, NewService};
-use futures::IntoFuture;
 
 use crate::data::{Data, DataFactory};
 use crate::error::Error;
@@ -33,14 +31,20 @@ pub struct AppService {
         Option<Guards>,
         Option<Rc<ResourceMap>>,
     )>,
+    service_data: Rc<Vec<Box<DataFactory>>>,
 }
 
 impl AppService {
     /// Crate server settings instance
-    pub(crate) fn new(config: AppConfig, default: Rc<HttpNewService>) -> Self {
+    pub(crate) fn new(
+        config: AppConfig,
+        default: Rc<HttpNewService>,
+        service_data: Rc<Vec<Box<DataFactory>>>,
+    ) -> Self {
         AppService {
             config,
             default,
+            service_data,
             root: true,
             services: Vec::new(),
         }
@@ -53,13 +57,16 @@ impl AppService {
 
     pub(crate) fn into_services(
         self,
-    ) -> Vec<(
-        ResourceDef,
-        HttpNewService,
-        Option<Guards>,
-        Option<Rc<ResourceMap>>,
-    )> {
-        self.services
+    ) -> (
+        AppConfig,
+        Vec<(
+            ResourceDef,
+            HttpNewService,
+            Option<Guards>,
+            Option<Rc<ResourceMap>>,
+        )>,
+    ) {
+        (self.config, self.services)
     }
 
     pub(crate) fn clone_config(&self) -> Self {
@@ -68,6 +75,7 @@ impl AppService {
             default: self.default.clone(),
             services: Vec::new(),
             root: false,
+            service_data: self.service_data.clone(),
         }
     }
 
@@ -81,6 +89,15 @@ impl AppService {
         self.default.clone()
     }
 
+    /// Set global route data
+    pub fn set_service_data(&self, extensions: &mut Extensions) -> bool {
+        for f in self.service_data.iter() {
+            f.create(extensions);
+        }
+        !self.service_data.is_empty()
+    }
+
+    /// Register http service
     pub fn register_service<F, S>(
         &mut self,
         rdef: ResourceDef,
@@ -90,6 +107,7 @@ impl AppService {
     ) where
         F: IntoNewService<S>,
         S: NewService<
+                Config = (),
                 Request = ServiceRequest,
                 Response = ServiceResponse,
                 Error = Error,
@@ -133,24 +151,12 @@ impl AppConfig {
     pub fn local_addr(&self) -> SocketAddr {
         self.0.addr
     }
-
-    /// Resource map
-    pub fn rmap(&self) -> &ResourceMap {
-        &self.0.rmap
-    }
-
-    /// Application extensions
-    pub fn extensions(&self) -> Ref<Extensions> {
-        self.0.extensions.borrow()
-    }
 }
 
 pub(crate) struct AppConfigInner {
     pub(crate) secure: bool,
     pub(crate) host: String,
     pub(crate) addr: SocketAddr,
-    pub(crate) rmap: ResourceMap,
-    pub(crate) extensions: RefCell<Extensions>,
 }
 
 impl Default for AppConfigInner {
@@ -159,8 +165,6 @@ impl Default for AppConfigInner {
             secure: false,
             addr: "127.0.0.1:8080".parse().unwrap(),
             host: "localhost:8080".to_owned(),
-            rmap: ResourceMap::new(ResourceDef::new("")),
-            extensions: RefCell::new(Extensions::new()),
         }
     }
 }
@@ -190,21 +194,6 @@ impl ServiceConfig {
     /// This is same as `App::data()` method.
     pub fn data<S: 'static>(&mut self, data: S) -> &mut Self {
         self.data.push(Box::new(Data::new(data)));
-        self
-    }
-
-    /// Set application data factory. This function is
-    /// similar to `.data()` but it accepts data factory. Data object get
-    /// constructed asynchronously during application initialization.
-    ///
-    /// This is same as `App::data_dactory()` method.
-    pub fn data_factory<F, R>(&mut self, data: F) -> &mut Self
-    where
-        F: Fn() -> R + 'static,
-        R: IntoFuture + 'static,
-        R::Error: std::fmt::Debug,
-    {
-        self.data.push(Box::new(data));
         self
     }
 
@@ -254,8 +243,6 @@ impl ServiceConfig {
 mod tests {
     use actix_service::Service;
     use bytes::Bytes;
-    use futures::Future;
-    use tokio_timer::sleep;
 
     use super::*;
     use crate::http::{Method, StatusCode};
@@ -277,37 +264,37 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    #[test]
-    fn test_data_factory() {
-        let cfg = |cfg: &mut ServiceConfig| {
-            cfg.data_factory(|| {
-                sleep(std::time::Duration::from_millis(50)).then(|_| {
-                    println!("READY");
-                    Ok::<_, ()>(10usize)
-                })
-            });
-        };
+    // #[test]
+    // fn test_data_factory() {
+    //     let cfg = |cfg: &mut ServiceConfig| {
+    //         cfg.data_factory(|| {
+    //             sleep(std::time::Duration::from_millis(50)).then(|_| {
+    //                 println!("READY");
+    //                 Ok::<_, ()>(10usize)
+    //             })
+    //         });
+    //     };
 
-        let mut srv =
-            init_service(App::new().configure(cfg).service(
-                web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
-            ));
-        let req = TestRequest::default().to_request();
-        let resp = block_on(srv.call(req)).unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+    //     let mut srv =
+    //         init_service(App::new().configure(cfg).service(
+    //             web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
+    //         ));
+    //     let req = TestRequest::default().to_request();
+    //     let resp = block_on(srv.call(req)).unwrap();
+    //     assert_eq!(resp.status(), StatusCode::OK);
 
-        let cfg2 = |cfg: &mut ServiceConfig| {
-            cfg.data_factory(|| Ok::<_, ()>(10u32));
-        };
-        let mut srv = init_service(
-            App::new()
-                .service(web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()))
-                .configure(cfg2),
-        );
-        let req = TestRequest::default().to_request();
-        let resp = block_on(srv.call(req)).unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
+    //     let cfg2 = |cfg: &mut ServiceConfig| {
+    //         cfg.data_factory(|| Ok::<_, ()>(10u32));
+    //     };
+    //     let mut srv = init_service(
+    //         App::new()
+    //             .service(web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()))
+    //             .configure(cfg2),
+    //     );
+    //     let req = TestRequest::default().to_request();
+    //     let resp = block_on(srv.call(req)).unwrap();
+    //     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // }
 
     #[test]
     fn test_external_resource() {
