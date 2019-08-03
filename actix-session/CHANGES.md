@@ -1,5 +1,20 @@
 # Changes
 
+## [0.2.0] - 2019-07-08
+
+*  Enhanced ``actix-session`` to facilitate state changes.  Use ``Session.renew()``
+   at successful login to cycle a session (new key/cookie but keeps state).
+   Use ``Session.purge()`` at logout to invalid a session cookie (and remove
+   from redis cache, if applicable).
+
+## [0.1.1] - 2019-06-03
+
+* Fix optional cookie session support
+
+## [0.1.0] - 2019-05-18
+
+* Use actix-web 1.0.0-rc
+
 ## [0.1.0-beta.4] - 2019-05-12
 
 * Use actix-web 1.0.0-beta.4

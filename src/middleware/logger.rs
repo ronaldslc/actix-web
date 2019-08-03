@@ -9,12 +9,13 @@ use actix_service::{Service, Transform};
 use bytes::Bytes;
 use futures::future::{ok, FutureResult};
 use futures::{Async, Future, Poll};
+use log::debug;
 use regex::Regex;
 use time;
 
 use crate::dev::{BodySize, MessageBody, ResponseBody};
 use crate::error::{Error, Result};
-use crate::http::{HeaderName, HttpTryFrom};
+use crate::http::{HeaderName, HttpTryFrom, StatusCode};
 use crate::service::{ServiceRequest, ServiceResponse};
 use crate::HttpResponse;
 
@@ -53,7 +54,7 @@ use crate::HttpResponse;
 ///
 /// `%a`  Remote IP-address (IP-address of proxy if using reverse proxy)
 ///
-/// `%t`  Time when the request was started to process
+/// `%t`  Time when the request was started to process (in rfc3339 format)
 ///
 /// `%r`  First line of request
 ///
@@ -201,6 +202,12 @@ where
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let res = futures::try_ready!(self.fut.poll());
+
+        if let Some(error) = res.response().error() {
+            if res.response().head().status != StatusCode::INTERNAL_SERVER_ERROR {
+                debug!("Error in response: {:?}", error);
+            }
+        }
 
         if let Some(ref mut format) = self.format {
             for unit in &mut format.0 {
@@ -415,12 +422,9 @@ impl FormatText {
                     ))
                 };
             }
-            FormatText::UrlPath => *self = FormatText::Str(format!("{}", req.path())),
+            FormatText::UrlPath => *self = FormatText::Str(req.path().to_string()),
             FormatText::RequestTime => {
-                *self = FormatText::Str(format!(
-                    "{:?}",
-                    now.strftime("[%d/%b/%Y:%H:%M:%S %z]").unwrap()
-                ))
+                *self = FormatText::Str(now.rfc3339().to_string())
             }
             FormatText::RequestHeader(ref name) => {
                 let s = if let Some(val) = req.headers().get(name) {
@@ -447,7 +451,9 @@ impl FormatText {
     }
 }
 
-pub(crate) struct FormatDisplay<'a>(&'a Fn(&mut Formatter) -> Result<(), fmt::Error>);
+pub(crate) struct FormatDisplay<'a>(
+    &'a dyn Fn(&mut Formatter) -> Result<(), fmt::Error>,
+);
 
 impl<'a> fmt::Display for FormatDisplay<'a> {
     fn fmt(&self, fmt: &mut Formatter) -> Result<(), fmt::Error> {
@@ -546,5 +552,30 @@ mod tests {
         assert!(s.contains("GET / HTTP/1.1"));
         assert!(s.contains("200 1024"));
         assert!(s.contains("ACTIX-WEB"));
+    }
+
+    #[test]
+    fn test_request_time_format() {
+        let mut format = Format::new("%t");
+        let req = TestRequest::default().to_srv_request();
+
+        let now = time::now();
+        for unit in &mut format.0 {
+            unit.render_request(now, &req);
+        }
+
+        let resp = HttpResponse::build(StatusCode::OK).force_close().finish();
+        for unit in &mut format.0 {
+            unit.render_response(&resp);
+        }
+
+        let render = |fmt: &mut Formatter| {
+            for unit in &format.0 {
+                unit.render(fmt, 1024, now)?;
+            }
+            Ok(())
+        };
+        let s = format!("{}", FormatDisplay(&render));
+        assert!(s.contains(&format!("{}", now.rfc3339())));
     }
 }

@@ -33,6 +33,7 @@ impl<B: MessageBody> Encoder<B> {
     ) -> ResponseBody<Encoder<B>> {
         let can_encode = !(head.headers().contains_key(&CONTENT_ENCODING)
             || head.status == StatusCode::SWITCHING_PROTOCOLS
+            || head.status == StatusCode::NO_CONTENT
             || encoding == ContentEncoding::Identity
             || encoding == ContentEncoding::Auto);
 
@@ -53,22 +54,24 @@ impl<B: MessageBody> Encoder<B> {
         };
 
         if can_encode {
-            update_head(encoding, head);
-            head.no_chunking(false);
-            ResponseBody::Body(Encoder {
-                body,
-                eof: false,
-                fut: None,
-                encoder: ContentEncoder::encoder(encoding),
-            })
-        } else {
-            ResponseBody::Body(Encoder {
-                body,
-                eof: false,
-                fut: None,
-                encoder: None,
-            })
+            // Modify response body only if encoder is not None
+            if let Some(enc) = ContentEncoder::encoder(encoding) {
+                update_head(encoding, head);
+                head.no_chunking(false);
+                return ResponseBody::Body(Encoder {
+                    body,
+                    eof: false,
+                    fut: None,
+                    encoder: Some(enc),
+                });
+            }
         }
+        ResponseBody::Body(Encoder {
+            body,
+            eof: false,
+            fut: None,
+            encoder: None,
+        })
     }
 }
 

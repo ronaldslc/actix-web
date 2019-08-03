@@ -1,5 +1,5 @@
 //! Multipart payload support
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, RefMut};
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::{cmp, fmt};
@@ -112,7 +112,7 @@ impl Stream for Multipart {
             Err(err)
         } else if self.safety.current() {
             let mut inner = self.inner.as_mut().unwrap().borrow_mut();
-            if let Some(payload) = inner.payload.get_mut(&self.safety) {
+            if let Some(mut payload) = inner.payload.get_mut(&self.safety) {
                 payload.poll_stream()?;
             }
             inner.poll(&self.safety)
@@ -128,7 +128,7 @@ impl InnerMultipart {
     fn read_headers(
         payload: &mut PayloadBuffer,
     ) -> Result<Option<HeaderMap>, MultipartError> {
-        match payload.read_until(b"\r\n\r\n") {
+        match payload.read_until(b"\r\n\r\n")? {
             None => {
                 if payload.eof {
                     Err(MultipartError::Incomplete)
@@ -167,7 +167,7 @@ impl InnerMultipart {
         boundary: &str,
     ) -> Result<Option<bool>, MultipartError> {
         // TODO: need to read epilogue
-        match payload.readline() {
+        match payload.readline()? {
             None => {
                 if payload.eof {
                     Ok(Some(true))
@@ -200,7 +200,7 @@ impl InnerMultipart {
     ) -> Result<Option<bool>, MultipartError> {
         let mut eof = false;
         loop {
-            match payload.readline() {
+            match payload.readline()? {
                 Some(chunk) => {
                     if chunk.is_empty() {
                         return Err(MultipartError::Boundary);
@@ -265,12 +265,12 @@ impl InnerMultipart {
                 }
             }
 
-            let headers = if let Some(payload) = self.payload.get_mut(safety) {
+            let headers = if let Some(mut payload) = self.payload.get_mut(safety) {
                 match self.state {
                     // read until first boundary
                     InnerState::FirstBoundary => {
                         match InnerMultipart::skip_until_boundary(
-                            payload,
+                            &mut *payload,
                             &self.boundary,
                         )? {
                             Some(eof) => {
@@ -286,7 +286,10 @@ impl InnerMultipart {
                     }
                     // read boundary
                     InnerState::Boundary => {
-                        match InnerMultipart::read_boundary(payload, &self.boundary)? {
+                        match InnerMultipart::read_boundary(
+                            &mut *payload,
+                            &self.boundary,
+                        )? {
                             None => return Ok(Async::NotReady),
                             Some(eof) => {
                                 if eof {
@@ -303,7 +306,7 @@ impl InnerMultipart {
 
                 // read field headers for next field
                 if self.state == InnerState::Headers {
-                    if let Some(headers) = InnerMultipart::read_headers(payload)? {
+                    if let Some(headers) = InnerMultipart::read_headers(&mut *payload)? {
                         self.state = InnerState::Boundary;
                         headers
                     } else {
@@ -411,14 +414,15 @@ impl Stream for Field {
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         if self.safety.current() {
             let mut inner = self.inner.borrow_mut();
-            if let Some(payload) = inner.payload.as_ref().unwrap().get_mut(&self.safety)
+            if let Some(mut payload) =
+                inner.payload.as_ref().unwrap().get_mut(&self.safety)
             {
                 payload.poll_stream()?;
             }
 
             inner.poll(&self.safety)
         } else if !self.safety.is_clean() {
-            return Err(MultipartError::NotConsumed);
+            Err(MultipartError::NotConsumed)
         } else {
             Ok(Async::NotReady)
         }
@@ -481,7 +485,7 @@ impl InnerField {
         if *size == 0 {
             Ok(Async::Ready(None))
         } else {
-            match payload.read_max(*size) {
+            match payload.read_max(*size)? {
                 Some(mut chunk) => {
                     let len = cmp::min(chunk.len() as u64, *size);
                     *size -= len;
@@ -512,7 +516,11 @@ impl InnerField {
 
         let len = payload.buf.len();
         if len == 0 {
-            return Ok(Async::NotReady);
+            return if payload.eof {
+                Err(MultipartError::Incomplete)
+            } else {
+                Ok(Async::NotReady)
+            };
         }
 
         // check boundary
@@ -529,13 +537,9 @@ impl InnerField {
                 let b_size = boundary.len() + b_len;
                 if len < b_size {
                     return Ok(Async::NotReady);
-                } else {
-                    if &payload.buf[b_len..b_size] == boundary.as_bytes() {
-                        // found boundary
-                        return Ok(Async::Ready(None));
-                    } else {
-                        pos = b_size;
-                    }
+                } else if &payload.buf[b_len..b_size] == boundary.as_bytes() {
+                    // found boundary
+                    return Ok(Async::Ready(None));
                 }
             }
         }
@@ -555,7 +559,7 @@ impl InnerField {
                     // check boundary
                     if (&payload.buf[cur..cur + 2] == b"\r\n"
                         && &payload.buf[cur + 2..cur + 4] == b"--")
-                        || (&payload.buf[cur..cur + 1] == b"\r"
+                        || (&payload.buf[cur..=cur] == b"\r"
                             && &payload.buf[cur + 1..cur + 3] == b"--")
                     {
                         if cur != 0 {
@@ -572,7 +576,7 @@ impl InnerField {
                     }
                 }
             } else {
-                return Ok(Async::Ready(Some(payload.buf.take().freeze())));
+                Ok(Async::Ready(Some(payload.buf.take().freeze())))
             };
         }
     }
@@ -582,12 +586,13 @@ impl InnerField {
             return Ok(Async::Ready(None));
         }
 
-        let result = if let Some(payload) = self.payload.as_ref().unwrap().get_mut(s) {
+        let result = if let Some(mut payload) = self.payload.as_ref().unwrap().get_mut(s)
+        {
             if !self.eof {
                 let res = if let Some(ref mut len) = self.length {
-                    InnerField::read_len(payload, len)?
+                    InnerField::read_len(&mut *payload, len)?
                 } else {
-                    InnerField::read_stream(payload, &self.boundary)?
+                    InnerField::read_stream(&mut *payload, &self.boundary)?
                 };
 
                 match res {
@@ -597,7 +602,7 @@ impl InnerField {
                 }
             }
 
-            match payload.readline() {
+            match payload.readline()? {
                 None => Async::Ready(None),
                 Some(line) => {
                     if line.as_ref() != b"\r\n" {
@@ -618,7 +623,7 @@ impl InnerField {
 }
 
 struct PayloadRef {
-    payload: Rc<UnsafeCell<PayloadBuffer>>,
+    payload: Rc<RefCell<PayloadBuffer>>,
 }
 
 impl PayloadRef {
@@ -628,15 +633,12 @@ impl PayloadRef {
         }
     }
 
-    fn get_mut<'a, 'b>(&'a self, s: &'b Safety) -> Option<&'a mut PayloadBuffer>
+    fn get_mut<'a, 'b>(&'a self, s: &'b Safety) -> Option<RefMut<'a, PayloadBuffer>>
     where
         'a: 'b,
     {
-        // Unsafe: Invariant is inforced by Safety Safety is used as ref counter,
-        // only top most ref can have mutable access to payload.
         if s.current() {
-            let payload: &mut PayloadBuffer = unsafe { &mut *self.payload.get() };
-            Some(payload)
+            Some(self.payload.borrow_mut())
         } else {
             None
         }
@@ -749,23 +751,31 @@ impl PayloadBuffer {
         }
     }
 
-    fn read_max(&mut self, size: u64) -> Option<Bytes> {
+    fn read_max(&mut self, size: u64) -> Result<Option<Bytes>, MultipartError> {
         if !self.buf.is_empty() {
             let size = std::cmp::min(self.buf.len() as u64, size) as usize;
-            Some(self.buf.split_to(size).freeze())
+            Ok(Some(self.buf.split_to(size).freeze()))
+        } else if self.eof {
+            Err(MultipartError::Incomplete)
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Read until specified ending
-    pub fn read_until(&mut self, line: &[u8]) -> Option<Bytes> {
-        twoway::find_bytes(&self.buf, line)
-            .map(|idx| self.buf.split_to(idx + line.len()).freeze())
+    pub fn read_until(&mut self, line: &[u8]) -> Result<Option<Bytes>, MultipartError> {
+        let res = twoway::find_bytes(&self.buf, line)
+            .map(|idx| self.buf.split_to(idx + line.len()).freeze());
+
+        if res.is_none() && self.eof {
+            Err(MultipartError::Incomplete)
+        } else {
+            Ok(res)
+        }
     }
 
     /// Read bytes until new line delimiter
-    pub fn readline(&mut self) -> Option<Bytes> {
+    pub fn readline(&mut self) -> Result<Option<Bytes>, MultipartError> {
         self.read_until(b"\n")
     }
 
@@ -991,7 +1001,7 @@ mod tests {
 
             assert_eq!(payload.buf.len(), 0);
             payload.poll_stream().unwrap();
-            assert_eq!(None, payload.read_max(1));
+            assert_eq!(None, payload.read_max(1).unwrap());
         })
     }
 
@@ -1001,14 +1011,14 @@ mod tests {
             let (mut sender, payload) = Payload::create(false);
             let mut payload = PayloadBuffer::new(payload);
 
-            assert_eq!(None, payload.read_max(4));
+            assert_eq!(None, payload.read_max(4).unwrap());
             sender.feed_data(Bytes::from("data"));
             sender.feed_eof();
             payload.poll_stream().unwrap();
 
-            assert_eq!(Some(Bytes::from("data")), payload.read_max(4));
+            assert_eq!(Some(Bytes::from("data")), payload.read_max(4).unwrap());
             assert_eq!(payload.buf.len(), 0);
-            assert_eq!(None, payload.read_max(1));
+            assert!(payload.read_max(1).is_err());
             assert!(payload.eof);
         })
     }
@@ -1018,7 +1028,7 @@ mod tests {
         run_on(|| {
             let (mut sender, payload) = Payload::create(false);
             let mut payload = PayloadBuffer::new(payload);
-            assert_eq!(None, payload.read_max(1));
+            assert_eq!(None, payload.read_max(1).unwrap());
             sender.set_error(PayloadError::Incomplete(None));
             payload.poll_stream().err().unwrap();
         })
@@ -1035,10 +1045,10 @@ mod tests {
             payload.poll_stream().unwrap();
             assert_eq!(payload.buf.len(), 10);
 
-            assert_eq!(Some(Bytes::from("line1")), payload.read_max(5));
+            assert_eq!(Some(Bytes::from("line1")), payload.read_max(5).unwrap());
             assert_eq!(payload.buf.len(), 5);
 
-            assert_eq!(Some(Bytes::from("line2")), payload.read_max(5));
+            assert_eq!(Some(Bytes::from("line2")), payload.read_max(5).unwrap());
             assert_eq!(payload.buf.len(), 0);
         })
     }
@@ -1069,16 +1079,22 @@ mod tests {
             let (mut sender, payload) = Payload::create(false);
             let mut payload = PayloadBuffer::new(payload);
 
-            assert_eq!(None, payload.read_until(b"ne"));
+            assert_eq!(None, payload.read_until(b"ne").unwrap());
 
             sender.feed_data(Bytes::from("line1"));
             sender.feed_data(Bytes::from("line2"));
             payload.poll_stream().unwrap();
 
-            assert_eq!(Some(Bytes::from("line")), payload.read_until(b"ne"));
+            assert_eq!(
+                Some(Bytes::from("line")),
+                payload.read_until(b"ne").unwrap()
+            );
             assert_eq!(payload.buf.len(), 6);
 
-            assert_eq!(Some(Bytes::from("1line2")), payload.read_until(b"2"));
+            assert_eq!(
+                Some(Bytes::from("1line2")),
+                payload.read_until(b"2").unwrap()
+            );
             assert_eq!(payload.buf.len(), 0);
         })
     }

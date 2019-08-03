@@ -52,6 +52,9 @@ impl Response<Body> {
     #[inline]
     pub fn from_error(error: Error) -> Response {
         let mut resp = error.as_response_error().render_response();
+        if resp.head.status == StatusCode::INTERNAL_SERVER_ERROR {
+            error!("Internal Server Error: {:?}", error);
+        }
         resp.error = Some(error);
         resp
     }
@@ -761,6 +764,25 @@ impl IntoFuture for ResponseBuilder {
 
     fn into_future(mut self) -> Self::Future {
         ok(self.finish())
+    }
+}
+
+impl fmt::Debug for ResponseBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let head = self.head.as_ref().unwrap();
+
+        let res = writeln!(
+            f,
+            "\nResponseBuilder {:?} {}{}",
+            head.version,
+            head.status,
+            head.reason.unwrap_or(""),
+        );
+        let _ = writeln!(f, "  headers:");
+        for (key, val) in head.headers.iter() {
+            let _ = writeln!(f, "    {:?}: {:?}", key, val);
+        }
+        res
     }
 }
 

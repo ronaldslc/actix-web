@@ -11,6 +11,7 @@ use actix_service::{
 use futures::future::{ok, Either, Future, FutureResult};
 use futures::{Async, IntoFuture, Poll};
 
+use crate::config::ServiceConfig;
 use crate::data::Data;
 use crate::dev::{AppService, HttpServiceFactory};
 use crate::error::Error;
@@ -22,12 +23,12 @@ use crate::service::{
     ServiceFactory, ServiceFactoryWrapper, ServiceRequest, ServiceResponse,
 };
 
-type Guards = Vec<Box<Guard>>;
+type Guards = Vec<Box<dyn Guard>>;
 type HttpService = BoxedService<ServiceRequest, ServiceResponse, Error>;
 type HttpNewService = BoxedNewService<(), ServiceRequest, ServiceResponse, Error, ()>;
 type BoxedResponse = Either<
     FutureResult<ServiceResponse, Error>,
-    Box<Future<Item = ServiceResponse, Error = Error>>,
+    Box<dyn Future<Item = ServiceResponse, Error = Error>>,
 >;
 
 /// Resources scope.
@@ -63,9 +64,10 @@ pub struct Scope<T = ScopeEndpoint> {
     endpoint: T,
     rdef: String,
     data: Option<Extensions>,
-    services: Vec<Box<ServiceFactory>>,
-    guards: Vec<Box<Guard>>,
+    services: Vec<Box<dyn ServiceFactory>>,
+    guards: Vec<Box<dyn Guard>>,
     default: Rc<RefCell<Option<Rc<HttpNewService>>>>,
+    external: Vec<ResourceDef>,
     factory_ref: Rc<RefCell<Option<ScopeFactory>>>,
 }
 
@@ -80,6 +82,7 @@ impl Scope {
             guards: Vec::new(),
             services: Vec::new(),
             default: Rc::new(RefCell::new(None)),
+            external: Vec::new(),
             factory_ref: fref,
         }
     }
@@ -150,6 +153,56 @@ where
             self.data = Some(Extensions::new());
         }
         self.data.as_mut().unwrap().insert(Data::new(data));
+        self
+    }
+
+    /// Run external configuration as part of the scope building
+    /// process
+    ///
+    /// This function is useful for moving parts of configuration to a
+    /// different module or even library. For example,
+    /// some of the resource's configuration could be moved to different module.
+    ///
+    /// ```rust
+    /// # extern crate actix_web;
+    /// use actix_web::{web, middleware, App, HttpResponse};
+    ///
+    /// // this function could be located in different module
+    /// fn config(cfg: &mut web::ServiceConfig) {
+    ///     cfg.service(web::resource("/test")
+    ///         .route(web::get().to(|| HttpResponse::Ok()))
+    ///         .route(web::head().to(|| HttpResponse::MethodNotAllowed()))
+    ///     );
+    /// }
+    ///
+    /// fn main() {
+    ///     let app = App::new()
+    ///         .wrap(middleware::Logger::default())
+    ///         .service(
+    ///             web::scope("/api")
+    ///                 .configure(config)
+    ///         )
+    ///         .route("/index.html", web::get().to(|| HttpResponse::Ok()));
+    /// }
+    /// ```
+    pub fn configure<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&mut ServiceConfig),
+    {
+        let mut cfg = ServiceConfig::new();
+        f(&mut cfg);
+        self.services.extend(cfg.services);
+        self.external.extend(cfg.external);
+
+        if !cfg.data.is_empty() {
+            let mut data = self.data.unwrap_or_else(Extensions::new);
+
+            for value in cfg.data.iter() {
+                value.create(&mut data);
+            }
+
+            self.data = Some(data);
+        }
         self
     }
 
@@ -281,6 +334,7 @@ where
             guards: self.guards,
             services: self.services,
             default: self.default,
+            external: self.external,
             factory_ref: self.factory_ref,
         }
     }
@@ -359,6 +413,11 @@ where
 
         let mut rmap = ResourceMap::new(ResourceDef::root_prefix(&self.rdef));
 
+        // external resources
+        for mut rdef in std::mem::replace(&mut self.external, Vec::new()) {
+            rmap.add(&mut rdef, None);
+        }
+
         // custom app data storage
         if let Some(ref mut ext) = self.data {
             config.set_service_data(ext);
@@ -366,7 +425,7 @@ where
 
         // complete scope pipeline creation
         *self.factory_ref.borrow_mut() = Some(ScopeFactory {
-            data: self.data.take().map(|data| Rc::new(data)),
+            data: self.data.take().map(Rc::new),
             default: self.default.clone(),
             services: Rc::new(
                 cfg.into_services()
@@ -444,10 +503,10 @@ pub struct ScopeFactoryResponse {
     fut: Vec<CreateScopeServiceItem>,
     data: Option<Rc<Extensions>>,
     default: Option<HttpService>,
-    default_fut: Option<Box<Future<Item = HttpService, Error = ()>>>,
+    default_fut: Option<Box<dyn Future<Item = HttpService, Error = ()>>>,
 }
 
-type HttpServiceFut = Box<Future<Item = HttpService, Error = ()>>;
+type HttpServiceFut = Box<dyn Future<Item = HttpService, Error = ()>>;
 
 enum CreateScopeServiceItem {
     Future(Option<ResourceDef>, Option<Guards>, HttpServiceFut),
@@ -519,7 +578,7 @@ impl Future for ScopeFactoryResponse {
 
 pub struct ScopeService {
     data: Option<Rc<Extensions>>,
-    router: Router<HttpService, Vec<Box<Guard>>>,
+    router: Router<HttpService, Vec<Box<dyn Guard>>>,
     default: Option<HttpService>,
     _ready: Option<(ServiceRequest, ResourceInfo)>,
 }
@@ -594,7 +653,7 @@ mod tests {
     use crate::dev::{Body, ResponseBody};
     use crate::http::{header, HeaderValue, Method, StatusCode};
     use crate::service::{ServiceRequest, ServiceResponse};
-    use crate::test::{block_on, call_service, init_service, TestRequest};
+    use crate::test::{block_on, call_service, init_service, read_body, TestRequest};
     use crate::{guard, web, App, Error, HttpRequest, HttpResponse};
 
     #[test]
@@ -1021,5 +1080,79 @@ mod tests {
         let req = TestRequest::with_uri("/app/t").to_request();
         let resp = call_service(&mut srv, req);
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_scope_config() {
+        let mut srv =
+            init_service(App::new().service(web::scope("/app").configure(|s| {
+                s.route("/path1", web::get().to(|| HttpResponse::Ok()));
+            })));
+
+        let req = TestRequest::with_uri("/app/path1").to_request();
+        let resp = block_on(srv.call(req)).unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_scope_config_2() {
+        let mut srv =
+            init_service(App::new().service(web::scope("/app").configure(|s| {
+                s.service(web::scope("/v1").configure(|s| {
+                    s.route("/", web::get().to(|| HttpResponse::Ok()));
+                }));
+            })));
+
+        let req = TestRequest::with_uri("/app/v1/").to_request();
+        let resp = block_on(srv.call(req)).unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_url_for_external() {
+        let mut srv =
+            init_service(App::new().service(web::scope("/app").configure(|s| {
+                s.service(web::scope("/v1").configure(|s| {
+                    s.external_resource(
+                        "youtube",
+                        "https://youtube.com/watch/{video_id}",
+                    );
+                    s.route(
+                        "/",
+                        web::get().to(|req: HttpRequest| {
+                            HttpResponse::Ok().body(format!(
+                                "{}",
+                                req.url_for("youtube", &["xxxxxx"]).unwrap().as_str()
+                            ))
+                        }),
+                    );
+                }));
+            })));
+
+        let req = TestRequest::with_uri("/app/v1/").to_request();
+        let resp = block_on(srv.call(req)).unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp);
+        assert_eq!(body, &b"https://youtube.com/watch/xxxxxx"[..]);
+    }
+
+    #[test]
+    fn test_url_for_nested() {
+        let mut srv = init_service(App::new().service(web::scope("/a").service(
+            web::scope("/b").service(web::resource("/c/{stuff}").name("c").route(
+                web::get().to(|req: HttpRequest| {
+                    HttpResponse::Ok()
+                        .body(format!("{}", req.url_for("c", &["12345"]).unwrap()))
+                }),
+            )),
+        )));
+        let req = TestRequest::with_uri("/a/b/c/test").to_request();
+        let resp = call_service(&mut srv, req);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp);
+        assert_eq!(
+            body,
+            Bytes::from_static(b"http://localhost:8080/a/b/c/12345")
+        );
     }
 }

@@ -11,6 +11,7 @@ use bitflags::bitflags;
 use mime;
 use mime_guess::guess_mime_type;
 
+use actix_http::body::SizedStream;
 use actix_web::http::header::{
     self, ContentDisposition, DispositionParam, DispositionType,
 };
@@ -22,9 +23,10 @@ use crate::range::HttpRange;
 use crate::ChunkedReadFile;
 
 bitflags! {
-    pub(crate) struct Flags: u32 {
-        const ETAG = 0b00000001;
-        const LAST_MD = 0b00000010;
+    pub(crate) struct Flags: u8 {
+        const ETAG = 0b0000_0001;
+        const LAST_MD = 0b0000_0010;
+        const CONTENT_DISPOSITION = 0b0000_0100;
     }
 }
 
@@ -39,13 +41,13 @@ impl Default for Flags {
 pub struct NamedFile {
     path: PathBuf,
     file: File,
+    modified: Option<SystemTime>,
+    pub(crate) md: Metadata,
+    pub(crate) flags: Flags,
+    pub(crate) status_code: StatusCode,
     pub(crate) content_type: mime::Mime,
     pub(crate) content_disposition: header::ContentDisposition,
-    pub(crate) md: Metadata,
-    modified: Option<SystemTime>,
     pub(crate) encoding: Option<ContentEncoding>,
-    pub(crate) status_code: StatusCode,
-    pub(crate) flags: Flags,
 }
 
 impl NamedFile {
@@ -175,11 +177,21 @@ impl NamedFile {
     /// sent to the peer. By default the disposition is `inline` for text,
     /// image, and video content types, and `attachment` otherwise, and
     /// the filename is taken from the path provided in the `open` method
-    /// after converting it to UTF-8 using
+    /// after converting it to UTF-8 using.
     /// [to_string_lossy](https://doc.rust-lang.org/std/ffi/struct.OsStr.html#method.to_string_lossy).
     #[inline]
     pub fn set_content_disposition(mut self, cd: header::ContentDisposition) -> Self {
         self.content_disposition = cd;
+        self.flags.insert(Flags::CONTENT_DISPOSITION);
+        self
+    }
+
+    /// Disable `Content-Disposition` header.
+    ///
+    /// By default Content-Disposition` header is enabled.
+    #[inline]
+    pub fn disable_content_disposition(mut self) -> Self {
+        self.flags.remove(Flags::CONTENT_DISPOSITION);
         self
     }
 
@@ -297,10 +309,12 @@ impl Responder for NamedFile {
         if self.status_code != StatusCode::OK {
             let mut resp = HttpResponse::build(self.status_code);
             resp.set(header::ContentType(self.content_type.clone()))
-                .header(
-                    header::CONTENT_DISPOSITION,
-                    self.content_disposition.to_string(),
-                );
+                .if_true(self.flags.contains(Flags::CONTENT_DISPOSITION), |res| {
+                    res.header(
+                        header::CONTENT_DISPOSITION,
+                        self.content_disposition.to_string(),
+                    );
+                });
             if let Some(current_encoding) = self.encoding {
                 resp.encoding(current_encoding);
             }
@@ -314,8 +328,8 @@ impl Responder for NamedFile {
             return Ok(resp.streaming(reader));
         }
 
-        match req.method() {
-            &Method::HEAD | &Method::GET => (),
+        match *req.method() {
+            Method::HEAD | Method::GET => (),
             _ => {
                 return Ok(HttpResponse::MethodNotAllowed()
                     .header(header::CONTENT_TYPE, "text/plain")
@@ -341,7 +355,12 @@ impl Responder for NamedFile {
         } else if let (Some(ref m), Some(header::IfUnmodifiedSince(ref since))) =
             (last_modified, req.get_header())
         {
-            m > since
+            let t1: SystemTime = m.clone().into();
+            let t2: SystemTime = since.clone().into();
+            match (t1.duration_since(UNIX_EPOCH), t2.duration_since(UNIX_EPOCH)) {
+                (Ok(t1), Ok(t2)) => t1 > t2,
+                _ => false,
+            }
         } else {
             false
         };
@@ -354,17 +373,24 @@ impl Responder for NamedFile {
         } else if let (Some(ref m), Some(header::IfModifiedSince(ref since))) =
             (last_modified, req.get_header())
         {
-            m <= since
+            let t1: SystemTime = m.clone().into();
+            let t2: SystemTime = since.clone().into();
+            match (t1.duration_since(UNIX_EPOCH), t2.duration_since(UNIX_EPOCH)) {
+                (Ok(t1), Ok(t2)) => t1 <= t2,
+                _ => false,
+            }
         } else {
             false
         };
 
         let mut resp = HttpResponse::build(self.status_code);
         resp.set(header::ContentType(self.content_type.clone()))
-            .header(
-                header::CONTENT_DISPOSITION,
-                self.content_disposition.to_string(),
-            );
+            .if_true(self.flags.contains(Flags::CONTENT_DISPOSITION), |res| {
+                res.header(
+                    header::CONTENT_DISPOSITION,
+                    self.content_disposition.to_string(),
+                );
+            });
         // default compressing
         if let Some(current_encoding) = self.encoding {
             resp.encoding(current_encoding);
@@ -407,28 +433,22 @@ impl Responder for NamedFile {
             };
         };
 
-        resp.header(header::CONTENT_LENGTH, format!("{}", length));
-
         if precondition_failed {
             return Ok(resp.status(StatusCode::PRECONDITION_FAILED).finish());
         } else if not_modified {
             return Ok(resp.status(StatusCode::NOT_MODIFIED).finish());
         }
 
-        if *req.method() == Method::HEAD {
-            Ok(resp.finish())
-        } else {
-            let reader = ChunkedReadFile {
-                offset,
-                size: length,
-                file: Some(self.file),
-                fut: None,
-                counter: 0,
-            };
-            if offset != 0 || length != self.md.len() {
-                return Ok(resp.status(StatusCode::PARTIAL_CONTENT).streaming(reader));
-            };
-            Ok(resp.streaming(reader))
-        }
+        let reader = ChunkedReadFile {
+            offset,
+            size: length,
+            file: Some(self.file),
+            fut: None,
+            counter: 0,
+        };
+        if offset != 0 || length != self.md.len() {
+            return Ok(resp.status(StatusCode::PARTIAL_CONTENT).streaming(reader));
+        };
+        Ok(resp.body(SizedStream::new(length, reader)))
     }
 }

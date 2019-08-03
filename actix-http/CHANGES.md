@@ -1,5 +1,83 @@
 # Changes
 
+## [0.2.8] - 2019-08-01
+
+### Added
+
+* Add `rustls` support
+
+* Add `Clone` impl for `HeaderMap`
+
+### Fixed
+
+* awc client panic #1016
+
+* Invalid response with compression middleware enabled, but compression-related features disabled #997
+
+
+## [0.2.7] - 2019-07-18
+
+### Added
+
+* Add support for downcasting response errors #986
+
+
+## [0.2.6] - 2019-07-17
+
+### Changed
+
+* Replace `ClonableService` with local copy
+
+* Upgrade `rand` dependency version to 0.7
+
+
+## [0.2.5] - 2019-06-28
+
+### Added
+
+* Add `on-connect` callback, `HttpServiceBuilder::on_connect()` #946
+
+### Changed
+
+* Use `encoding_rs` crate instead of unmaintained `encoding` crate
+
+* Add `Copy` and `Clone` impls for `ws::Codec`
+
+
+## [0.2.4] - 2019-06-16
+
+### Fixed
+
+* Do not compress NoContent (204) responses #918
+
+
+## [0.2.3] - 2019-06-02
+
+### Added
+
+* Debug impl for ResponseBuilder
+
+* From SizedStream and BodyStream for Body
+
+### Changed
+
+* SizedStream uses u64
+
+
+## [0.2.2] - 2019-05-29
+
+### Fixed
+
+* Parse incoming stream before closing stream on disconnect #868
+
+
+## [0.2.1] - 2019-05-25
+
+### Fixed
+
+* Handle socket read disconnect
+
+
 ## [0.2.0] - 2019-05-12
 
 ### Changed
@@ -49,7 +127,7 @@
 
 ## [0.1.1] - 2019-04-19
 
-### Changes
+### Changed
 
 * Cookie::max_age() accepts value in seconds
 

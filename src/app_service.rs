@@ -18,13 +18,15 @@ use crate::request::{HttpRequest, HttpRequestPool};
 use crate::rmap::ResourceMap;
 use crate::service::{ServiceFactory, ServiceRequest, ServiceResponse};
 
-type Guards = Vec<Box<Guard>>;
+type Guards = Vec<Box<dyn Guard>>;
 type HttpService = BoxedService<ServiceRequest, ServiceResponse, Error>;
 type HttpNewService = BoxedNewService<(), ServiceRequest, ServiceResponse, Error, ()>;
 type BoxedResponse = Either<
     FutureResult<ServiceResponse, Error>,
-    Box<Future<Item = ServiceResponse, Error = Error>>,
+    Box<dyn Future<Item = ServiceResponse, Error = Error>>,
 >;
+type FnDataFactory =
+    Box<dyn Fn() -> Box<dyn Future<Item = Box<dyn DataFactory>, Error = ()>>>;
 
 /// Service factory to convert `Request` to a `ServiceRequest<S>`.
 /// It also executes data factories.
@@ -39,9 +41,10 @@ where
     >,
 {
     pub(crate) endpoint: T,
-    pub(crate) data: Rc<Vec<Box<DataFactory>>>,
+    pub(crate) data: Rc<Vec<Box<dyn DataFactory>>>,
+    pub(crate) data_factories: Rc<Vec<FnDataFactory>>,
     pub(crate) config: RefCell<AppConfig>,
-    pub(crate) services: Rc<RefCell<Vec<Box<ServiceFactory>>>>,
+    pub(crate) services: Rc<RefCell<Vec<Box<dyn ServiceFactory>>>>,
     pub(crate) default: Option<Rc<HttpNewService>>,
     pub(crate) factory_ref: Rc<RefCell<Option<AppRoutingFactory>>>,
     pub(crate) external: RefCell<Vec<ResourceDef>>,
@@ -119,16 +122,12 @@ where
         let rmap = Rc::new(rmap);
         rmap.finish(rmap.clone());
 
-        // create app data container
-        let mut data = Extensions::new();
-        for f in self.data.iter() {
-            f.create(&mut data);
-        }
-
         AppInitResult {
             endpoint: None,
             endpoint_fut: self.endpoint.new_service(&()),
-            data: Rc::new(data),
+            data: self.data.clone(),
+            data_factories: Vec::new(),
+            data_factories_fut: self.data_factories.iter().map(|f| f()).collect(),
             config,
             rmap,
             _t: PhantomData,
@@ -144,7 +143,9 @@ where
     endpoint_fut: T::Future,
     rmap: Rc<ResourceMap>,
     config: AppConfig,
-    data: Rc<Extensions>,
+    data: Rc<Vec<Box<dyn DataFactory>>>,
+    data_factories: Vec<Box<dyn DataFactory>>,
+    data_factories_fut: Vec<Box<dyn Future<Item = Box<dyn DataFactory>, Error = ()>>>,
     _t: PhantomData<B>,
 }
 
@@ -159,21 +160,43 @@ where
     >,
 {
     type Item = AppInitService<T::Service, B>;
-    type Error = T::InitError;
+    type Error = ();
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        // async data factories
+        let mut idx = 0;
+        while idx < self.data_factories_fut.len() {
+            match self.data_factories_fut[idx].poll()? {
+                Async::Ready(f) => {
+                    self.data_factories.push(f);
+                    self.data_factories_fut.remove(idx);
+                }
+                Async::NotReady => idx += 1,
+            }
+        }
+
         if self.endpoint.is_none() {
             if let Async::Ready(srv) = self.endpoint_fut.poll()? {
                 self.endpoint = Some(srv);
             }
         }
 
-        if self.endpoint.is_some() {
+        if self.endpoint.is_some() && self.data_factories_fut.is_empty() {
+            // create app data container
+            let mut data = Extensions::new();
+            for f in self.data.iter() {
+                f.create(&mut data);
+            }
+
+            for f in &self.data_factories {
+                f.create(&mut data);
+            }
+
             Ok(Async::Ready(AppInitService {
                 service: self.endpoint.take().unwrap(),
                 rmap: self.rmap.clone(),
                 config: self.config.clone(),
-                data: self.data.clone(),
+                data: Rc::new(data),
                 pool: HttpRequestPool::create(),
             }))
         } else {
@@ -183,7 +206,7 @@ where
 }
 
 /// Service to convert `Request` to a `ServiceRequest<S>`
-pub struct AppInitService<T: Service, B>
+pub struct AppInitService<T, B>
 where
     T: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
 {
@@ -215,19 +238,30 @@ where
             inner.path.get_mut().update(&head.uri);
             inner.path.reset();
             inner.head = head;
+            inner.payload = payload;
             inner.app_data = self.data.clone();
             req
         } else {
             HttpRequest::new(
                 Path::new(Url::new(head.uri.clone())),
                 head,
+                payload,
                 self.rmap.clone(),
                 self.config.clone(),
                 self.data.clone(),
                 self.pool,
             )
         };
-        self.service.call(ServiceRequest::from_parts(req, payload))
+        self.service.call(ServiceRequest::new(req))
+    }
+}
+
+impl<T, B> Drop for AppInitService<T, B>
+where
+    T: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+{
+    fn drop(&mut self) {
+        self.pool.clear();
     }
 }
 
@@ -264,14 +298,14 @@ impl NewService for AppRoutingFactory {
     }
 }
 
-type HttpServiceFut = Box<Future<Item = HttpService, Error = ()>>;
+type HttpServiceFut = Box<dyn Future<Item = HttpService, Error = ()>>;
 
 /// Create app service
 #[doc(hidden)]
 pub struct AppRoutingFactoryResponse {
     fut: Vec<CreateAppRoutingItem>,
     default: Option<HttpService>,
-    default_fut: Option<Box<Future<Item = HttpService, Error = ()>>>,
+    default_fut: Option<Box<dyn Future<Item = HttpService, Error = ()>>>,
 }
 
 enum CreateAppRoutingItem {
@@ -406,5 +440,39 @@ impl NewService for AppEntry {
 
     fn new_service(&self, _: &()) -> Self::Future {
         self.factory.borrow_mut().as_mut().unwrap().new_service(&())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_service::Service;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use crate::{test, web, App, HttpResponse};
+
+    struct DropData(Arc<AtomicBool>);
+
+    impl Drop for DropData {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn drop_data() {
+        let data = Arc::new(AtomicBool::new(false));
+        {
+            let mut app = test::init_service(
+                App::new()
+                    .data(DropData(data.clone()))
+                    .service(web::resource("/test").to(|| HttpResponse::Ok())),
+            );
+            let req = test::TestRequest::with_uri("/test").to_request();
+            let _ = test::block_on(app.call(req)).unwrap();
+        }
+        assert!(data.load(Ordering::Relaxed));
     }
 }

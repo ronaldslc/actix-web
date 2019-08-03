@@ -2,18 +2,19 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use actix_http::http::header::{Header, HeaderName, IntoHeaderValue};
+use actix_http::http::header::{ContentType, Header, HeaderName, IntoHeaderValue};
 use actix_http::http::{HttpTryFrom, Method, StatusCode, Uri, Version};
 use actix_http::test::TestRequest as HttpTestRequest;
 use actix_http::{cookie::Cookie, Extensions, Request};
 use actix_router::{Path, ResourceDef, Url};
-use actix_rt::Runtime;
+use actix_rt::{System, SystemRunner};
 use actix_server_config::ServerConfig;
 use actix_service::{IntoNewService, IntoService, NewService, Service};
 use bytes::{Bytes, BytesMut};
 use futures::future::{lazy, ok, Future, IntoFuture};
 use futures::Stream;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json;
 
 pub use actix_http::test::TestBuffer;
@@ -28,14 +29,14 @@ use crate::{Error, HttpRequest, HttpResponse};
 
 thread_local! {
     static RT: RefCell<Inner> = {
-        RefCell::new(Inner(Some(Runtime::new().unwrap())))
+        RefCell::new(Inner(Some(System::builder().build())))
     };
 }
 
-struct Inner(Option<Runtime>);
+struct Inner(Option<SystemRunner>);
 
 impl Inner {
-    fn get_mut(&mut self) -> &mut Runtime {
+    fn get_mut(&mut self) -> &mut SystemRunner {
         self.0.as_mut().unwrap()
     }
 }
@@ -63,7 +64,7 @@ where
     RT.with(move |rt| rt.borrow_mut().get_mut().block_on(f.into_future()))
 }
 
-/// Runs the provided function, blocking the current thread until the resul
+/// Runs the provided function, blocking the current thread until the result
 /// future completes.
 ///
 /// This function can be used to synchronously block the current thread
@@ -78,7 +79,7 @@ where
     F: FnOnce() -> R,
     R: IntoFuture,
 {
-    RT.with(move |rt| rt.borrow_mut().get_mut().block_on(lazy(|| f())))
+    RT.with(move |rt| rt.borrow_mut().get_mut().block_on(lazy(f)))
 }
 
 #[doc(hidden)]
@@ -248,7 +249,7 @@ where
 ///         .header(header::CONTENT_TYPE, "application/json")
 ///         .to_request();
 ///
-///     let resp = call_service(&mut srv, req);
+///     let resp = test::call_service(&mut app, req);
 ///     let result = test::read_body(resp);
 ///     assert_eq!(result, Bytes::from_static(b"welcome!"));
 /// }
@@ -477,6 +478,16 @@ impl TestRequest {
         self
     }
 
+    /// Serialize `data` to JSON and set it as the request payload. The `Content-Type` header is
+    /// set to `application/json`.
+    pub fn set_json<T: Serialize>(mut self, data: &T) -> Self {
+        let bytes =
+            serde_json::to_string(data).expect("Failed to serialize test data to json");
+        self.req.set_payload(bytes);
+        self.req.set(ContentType::json());
+        self
+    }
+
     /// Set application data. This is equivalent of `App::data()` method
     /// for testing purpose.
     pub fn data<T: 'static>(mut self, data: T) -> Self {
@@ -501,16 +512,15 @@ impl TestRequest {
         let (head, payload) = self.req.finish().into_parts();
         self.path.get_mut().update(&head.uri);
 
-        let req = HttpRequest::new(
+        ServiceRequest::new(HttpRequest::new(
             self.path,
             head,
+            payload,
             Rc::new(self.rmap),
             AppConfig::new(self.config),
             Rc::new(self.app_data),
             HttpRequestPool::create(),
-        );
-
-        ServiceRequest::from_parts(req, payload)
+        ))
     }
 
     /// Complete request creation and generate `ServiceResponse` instance
@@ -520,12 +530,13 @@ impl TestRequest {
 
     /// Complete request creation and generate `HttpRequest` instance
     pub fn to_http_request(mut self) -> HttpRequest {
-        let (head, _) = self.req.finish().into_parts();
+        let (head, payload) = self.req.finish().into_parts();
         self.path.get_mut().update(&head.uri);
 
         HttpRequest::new(
             self.path,
             head,
+            payload,
             Rc::new(self.rmap),
             AppConfig::new(self.config),
             Rc::new(self.app_data),
@@ -541,6 +552,7 @@ impl TestRequest {
         let req = HttpRequest::new(
             self.path,
             head,
+            Payload::None,
             Rc::new(self.rmap),
             AppConfig::new(self.config),
             Rc::new(self.app_data),
@@ -553,6 +565,7 @@ impl TestRequest {
 
 #[cfg(test)]
 mod tests {
+    use actix_http::httpmessage::HttpMessage;
     use serde::{Deserialize, Serialize};
     use std::time::SystemTime;
 
@@ -658,6 +671,31 @@ mod tests {
     }
 
     #[test]
+    fn test_request_response_json() {
+        let mut app = init_service(App::new().service(web::resource("/people").route(
+            web::post().to(|person: web::Json<Person>| {
+                HttpResponse::Ok().json(person.into_inner())
+            }),
+        )));
+
+        let payload = Person {
+            id: "12345".to_string(),
+            name: "User name".to_string(),
+        };
+
+        let req = TestRequest::post()
+            .uri("/people")
+            .set_json(&payload)
+            .to_request();
+
+        assert_eq!(req.content_type(), "application/json");
+
+        let result: Person = read_response_json(&mut app, req);
+        assert_eq!(&result.id, "12345");
+        assert_eq!(&result.name, "User name");
+    }
+
+    #[test]
     fn test_async_with_block() {
         fn async_with_block() -> impl Future<Item = HttpResponse, Error = Error> {
             web::block(move || Some(4).ok_or("wrong")).then(|res| match res {
@@ -671,6 +709,44 @@ mod tests {
         let mut app = init_service(
             App::new().service(web::resource("/index.html").to_async(async_with_block)),
         );
+
+        let req = TestRequest::post().uri("/index.html").to_request();
+        let res = block_fn(|| app.call(req)).unwrap();
+        assert!(res.status().is_success());
+    }
+
+    #[test]
+    fn test_actor() {
+        use actix::Actor;
+
+        struct MyActor;
+
+        struct Num(usize);
+        impl actix::Message for Num {
+            type Result = usize;
+        }
+        impl actix::Actor for MyActor {
+            type Context = actix::Context<Self>;
+        }
+        impl actix::Handler<Num> for MyActor {
+            type Result = usize;
+            fn handle(&mut self, msg: Num, _: &mut Self::Context) -> Self::Result {
+                msg.0
+            }
+        }
+
+        let addr = run_on(|| MyActor.start());
+        let mut app = init_service(App::new().service(
+            web::resource("/index.html").to_async(move || {
+                addr.send(Num(1)).from_err().and_then(|res| {
+                    if res == 1 {
+                        HttpResponse::Ok()
+                    } else {
+                        HttpResponse::BadRequest()
+                    }
+                })
+            }),
+        ));
 
         let req = TestRequest::post().uri("/index.html").to_request();
         let res = block_fn(|| app.call(req)).unwrap();

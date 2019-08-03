@@ -20,6 +20,7 @@ pub struct HttpRequest(pub(crate) Rc<HttpRequestInner>);
 pub(crate) struct HttpRequestInner {
     pub(crate) head: Message<RequestHead>,
     pub(crate) path: Path<Url>,
+    pub(crate) payload: Payload,
     pub(crate) app_data: Rc<Extensions>,
     rmap: Rc<ResourceMap>,
     config: AppConfig,
@@ -31,6 +32,7 @@ impl HttpRequest {
     pub(crate) fn new(
         path: Path<Url>,
         head: Message<RequestHead>,
+        payload: Payload,
         rmap: Rc<ResourceMap>,
         config: AppConfig,
         app_data: Rc<Extensions>,
@@ -39,6 +41,7 @@ impl HttpRequest {
         HttpRequest(Rc::new(HttpRequestInner {
             head,
             path,
+            payload,
             rmap,
             config,
             app_data,
@@ -171,6 +174,12 @@ impl HttpRequest {
         self.url_for(name, &NO_PARAMS)
     }
 
+    #[inline]
+    /// Get a reference to a `ResourceMap` of current application.
+    pub fn resource_map(&self) -> &ResourceMap {
+        &self.0.rmap
+    }
+
     /// Peer socket address
     ///
     /// Peer address is actual socket address, if proxy is used in front of
@@ -183,6 +192,9 @@ impl HttpRequest {
     }
 
     /// Get *ConnectionInfo* for the current request.
+    ///
+    /// This method panics if request's extensions container is already
+    /// borrowed.
     #[inline]
     pub fn connection_info(&self) -> Ref<ConnectionInfo> {
         ConnectionInfo::get(self.head(), &*self.app_config())
@@ -324,6 +336,10 @@ impl HttpRequestPool {
         } else {
             None
         }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.0.borrow_mut().clear()
     }
 }
 

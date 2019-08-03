@@ -54,7 +54,7 @@ pub(crate) trait DataFactory {
 ///
 ///     let app = App::new()
 ///         // Store `MyData` in application storage.
-///         .data(data.clone())
+///         .register_data(data.clone())
 ///         .service(
 ///             web::resource("/index.html").route(
 ///                 web::get().to(index)));
@@ -73,7 +73,7 @@ impl<T> Data<T> {
         Data(Arc::new(state))
     }
 
-    /// Get referecnce to inner app data.
+    /// Get reference to inner app data.
     pub fn get_ref(&self) -> &T {
         self.0.as_ref()
     }
@@ -118,7 +118,7 @@ impl<T: 'static> FromRequest for Data<T> {
 impl<T: 'static> DataFactory for Data<T> {
     fn create(&self, extensions: &mut Extensions) -> bool {
         if !extensions.contains::<Data<T>>() {
-            let _ = extensions.insert(Data(self.0.clone()));
+            extensions.insert(Data(self.0.clone()));
             true
         } else {
             false
@@ -130,6 +130,7 @@ impl<T: 'static> DataFactory for Data<T> {
 mod tests {
     use actix_service::Service;
 
+    use super::*;
     use crate::http::StatusCode;
     use crate::test::{block_on, init_service, TestRequest};
     use crate::{web, App, HttpResponse};
@@ -147,6 +148,26 @@ mod tests {
 
         let mut srv =
             init_service(App::new().data(10u32).service(
+                web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
+            ));
+        let req = TestRequest::default().to_request();
+        let resp = block_on(srv.call(req)).unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_register_data_extractor() {
+        let mut srv =
+            init_service(App::new().register_data(Data::new(10usize)).service(
+                web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
+            ));
+
+        let req = TestRequest::default().to_request();
+        let resp = block_on(srv.call(req)).unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut srv =
+            init_service(App::new().register_data(Data::new(10u32)).service(
                 web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
             ));
         let req = TestRequest::default().to_request();

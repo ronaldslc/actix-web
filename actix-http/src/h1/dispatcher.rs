@@ -5,7 +5,6 @@ use std::{fmt, io, net};
 use actix_codec::{Decoder, Encoder, Framed, FramedParts};
 use actix_server_config::IoStream;
 use actix_service::Service;
-use actix_utils::cloneable::CloneableService;
 use bitflags::bitflags;
 use bytes::{BufMut, BytesMut};
 use futures::{Async, Future, Poll};
@@ -13,9 +12,12 @@ use log::{error, trace};
 use tokio_timer::Delay;
 
 use crate::body::{Body, BodySize, MessageBody, ResponseBody};
+use crate::cloneable::CloneableService;
 use crate::config::ServiceConfig;
 use crate::error::{DispatchError, Error};
 use crate::error::{ParseError, PayloadError};
+use crate::helpers::DataFactory;
+use crate::httpmessage::HttpMessage;
 use crate::request::Request;
 use crate::response::Response;
 
@@ -81,6 +83,7 @@ where
     service: CloneableService<S>,
     expect: CloneableService<X>,
     upgrade: Option<CloneableService<U>>,
+    on_connect: Option<Box<dyn DataFactory>>,
     flags: Flags,
     peer_addr: Option<net::SocketAddr>,
     error: Option<DispatchError>,
@@ -174,12 +177,13 @@ where
     U::Error: fmt::Display,
 {
     /// Create http/1 dispatcher.
-    pub fn new(
+    pub(crate) fn new(
         stream: T,
         config: ServiceConfig,
         service: CloneableService<S>,
         expect: CloneableService<X>,
         upgrade: Option<CloneableService<U>>,
+        on_connect: Option<Box<dyn DataFactory>>,
     ) -> Self {
         Dispatcher::with_timeout(
             stream,
@@ -190,11 +194,12 @@ where
             service,
             expect,
             upgrade,
+            on_connect,
         )
     }
 
     /// Create http/1 dispatcher with slow request timeout.
-    pub fn with_timeout(
+    pub(crate) fn with_timeout(
         io: T,
         codec: Codec,
         config: ServiceConfig,
@@ -203,6 +208,7 @@ where
         service: CloneableService<S>,
         expect: CloneableService<X>,
         upgrade: Option<CloneableService<U>>,
+        on_connect: Option<Box<dyn DataFactory>>,
     ) -> Self {
         let keepalive = config.keep_alive_enabled();
         let flags = if keepalive {
@@ -234,6 +240,7 @@ where
                 service,
                 expect,
                 upgrade,
+                on_connect,
                 flags,
                 ka_expire,
                 ka_timer,
@@ -495,6 +502,11 @@ where
                             let pl = self.codec.message_type();
                             req.head_mut().peer_addr = self.peer_addr;
 
+                            // on_connect data
+                            if let Some(ref on_connect) = self.on_connect {
+                                on_connect.set(&mut req.extensions_mut());
+                            }
+
                             if pl == MessageType::Stream && self.upgrade.is_some() {
                                 self.messages.push_back(DispatcherMessage::Upgrade(req));
                                 break;
@@ -583,6 +595,9 @@ where
                     self.ka_timer = Some(Delay::new(interval));
                 } else {
                     self.flags.insert(Flags::READ_DISCONNECT);
+                    if let Some(mut payload) = self.payload.take() {
+                        payload.set_error(PayloadError::Incomplete(None));
+                    }
                     return Ok(());
                 }
             } else {
@@ -690,15 +705,21 @@ where
                     }
                 } else {
                     // read socket into a buf
-                    if !inner.flags.contains(Flags::READ_DISCONNECT) {
-                        if let Some(true) =
+                    let should_disconnect =
+                        if !inner.flags.contains(Flags::READ_DISCONNECT) {
                             read_available(&mut inner.io, &mut inner.read_buf)?
-                        {
-                            inner.flags.insert(Flags::READ_DISCONNECT)
-                        }
-                    }
+                        } else {
+                            None
+                        };
 
                     inner.poll_request()?;
+                    if let Some(true) = should_disconnect {
+                        inner.flags.insert(Flags::READ_DISCONNECT);
+                        if let Some(mut payload) = inner.payload.take() {
+                            payload.feed_eof();
+                        }
+                    };
+
                     loop {
                         if inner.write_buf.remaining_mut() < LW_BUFFER_SIZE {
                             inner.write_buf.reserve(HW_BUFFER_SIZE);
@@ -841,6 +862,7 @@ mod tests {
                     (|_| ok::<_, Error>(Response::Ok().finish())).into_service(),
                 ),
                 CloneableService::new(ExpectHandler),
+                None,
                 None,
             );
             assert!(h1.poll().is_err());
