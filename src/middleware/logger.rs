@@ -383,6 +383,8 @@ impl FormatText {
                     let rt = (rt.num_nanoseconds().unwrap_or(0) as f64) / 1_000_000.0;
                     return fmt.write_fmt(format_args!("{:.6}", rt));
                 }
+
+                "-".fmt(fmt)
             }
             FormatText::TimeMillis => {
                 let rt = time::now() - entry_time;
