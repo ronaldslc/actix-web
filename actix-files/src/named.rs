@@ -169,7 +169,7 @@ impl NamedFile {
     }
 
     pub fn content_type(&self) -> &mime::Mime {
-       &self.content_type
+        &self.content_type
     }
 
     /// Set the Content-Disposition for serving this file. This allows
