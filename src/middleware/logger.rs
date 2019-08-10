@@ -9,7 +9,7 @@ use actix_service::{Service, Transform};
 use bytes::Bytes;
 use futures::future::{ok, FutureResult};
 use futures::{Async, Future, Poll};
-use log::debug;
+use log::error;
 use regex::Regex;
 use time;
 
@@ -206,9 +206,7 @@ where
         let res = futures::try_ready!(self.fut.poll());
 
         if let Some(error) = res.response().error() {
-            if res.response().head().status != StatusCode::INTERNAL_SERVER_ERROR {
-                debug!("Error in response: {:?}", error);
-            }
+            error!("Error in response: {:?}", error);
         }
 
         if let Some(ref mut format) = self.format {
