@@ -22,8 +22,8 @@ use bytes::Bytes;
 use futures::future::{ok, Either, FutureResult};
 use futures::{Async, Future, Poll, Stream};
 use mime;
-use mime_guess::get_mime_type;
-use percent_encoding::{utf8_percent_encode, DEFAULT_ENCODE_SET};
+use mime_guess::from_ext;
+use percent_encoding::{utf8_percent_encode, CONTROLS};
 use v_htmlescape::escape as escape_html_entity;
 
 mod error;
@@ -42,7 +42,7 @@ type HttpNewService = BoxedNewService<(), ServiceRequest, ServiceResponse, Error
 /// the type `application/octet-stream`.
 #[inline]
 pub fn file_extension_to_mime(ext: &str) -> mime::Mime {
-    get_mime_type(ext)
+    from_ext(ext).first_or_octet_stream()
 }
 
 #[doc(hidden)]
@@ -144,7 +144,7 @@ impl Directory {
 // show file url as relative to static path
 macro_rules! encode_file_url {
     ($path:ident) => {
-        utf8_percent_encode(&$path.to_string_lossy(), DEFAULT_ENCODE_SET)
+        utf8_percent_encode(&$path.to_string_lossy(), CONTROLS)
     };
 }
 
