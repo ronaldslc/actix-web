@@ -1,6 +1,13 @@
 # Changes
 
-## [1.0.6] - 2019-xx-xx
+## [1.0.7] - 2019-08-29
+
+### Fixed
+
+* Request Extensions leak #1062
+
+
+## [1.0.6] - 2019-08-28
 
 ### Added
 
@@ -8,9 +15,16 @@
 
 * Form immplements Responder, returning a `application/x-www-form-urlencoded` response
 
+* Add `into_inner` to `Data`
+
+* Add `test::TestRequest::set_form()` convenience method to automatically serialize data and set
+  the header in test requests.
+
 ### Changed
 
 * `Query` payload made `pub`. Allows user to pattern-match the payload.
+
+* Enable `rust-tls` feature for client #1045
 
 * Update serde_urlencoded to 0.6.1
 
