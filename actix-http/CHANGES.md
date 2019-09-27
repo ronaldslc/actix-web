@@ -1,8 +1,24 @@
 # Changes
 
-## [0.2.10] - 2019-09-xx
+## Not released yet
+
+### Added
+
+* Add support for serde_json::Value to be passed as argument to ResponseBuilder.body()
+
+
+## [0.2.10] - 2019-09-11
+
+### Added
+
+* Add support for sending HTTP requests with `Rc<RequestHead>` in addition to sending HTTP requests with `RequestHead`
+
+* Allow to use `std::convert::Infallible` as `actix_http::error::Error`
+
 
 ### Fixed
+
+* h2 will use error response #1080
 
 * on_connect result isn't added to request extensions for http2 requests #1009
 

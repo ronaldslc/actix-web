@@ -1,10 +1,30 @@
 # Changes
 
-## [0.2.5] - 2019-09-06
+
+## [0.2.7] - 2019-09-25
+
+### Added
+
+* Remaining getter methods for `ClientRequest`'s private `head` field #1101
+
+
+## [0.2.6] - 2019-09-12
+
+### Added
+
+* Export frozen request related types.
+
+
+## [0.2.5] - 2019-09-11
+
+### Added
+
+* Add `FrozenClientRequest` to support retries for sending HTTP requests
 
 ### Changed
 
 * Ensure that the `Host` header is set when initiating a WebSocket client connection.
+
 
 ## [0.2.4] - 2019-08-13
 

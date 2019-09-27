@@ -1,13 +1,25 @@
 # Changes
-## not released yet
+
+## [1.0.8] - 2019-09-25
 
 ### Added
 
-*  Add `middleware::Conditon` that conditionally enables another middleware
+* Add `Scope::register_data` and `Resource::register_data` methods, parallel to
+  `App::register_data`.
 
-### Fixed
+* Add `middleware::Condition` that conditionally enables another middleware
 
-* h2 will use error response #1080
+* Allow to re-construct `ServiceRequest` from `HttpRequest` and `Payload`
+
+* Add `HttpServer::listen_uds` for ability to listen on UDS FD rather than path,
+  which is useful for example with systemd.
+
+### Changed
+
+* Make UrlEncodedError::Overflow more informativve
+
+* Use actix-testing for testing utils
+
 
 ## [1.0.7] - 2019-08-29
 
