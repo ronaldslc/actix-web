@@ -18,7 +18,7 @@ use time;
 
 use crate::dev::{BodySize, MessageBody, ResponseBody};
 use crate::error::{Error, Result};
-use crate::http::{HeaderName, StatusCode};
+use crate::http::{HeaderName};
 use crate::service::{ServiceRequest, ServiceResponse};
 use crate::HttpResponse;
 
