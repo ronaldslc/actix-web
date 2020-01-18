@@ -1,11 +1,11 @@
+use std::convert::TryFrom;
 use std::fmt::Write as FmtWrite;
-use std::io::Write;
 use std::rc::Rc;
 use std::time::Duration;
 use std::{fmt, net};
 
-use bytes::{BufMut, Bytes, BytesMut};
-use futures::Stream;
+use bytes::Bytes;
+use futures_core::Stream;
 use percent_encoding::percent_encode;
 use serde::Serialize;
 
@@ -13,8 +13,8 @@ use actix_http::body::Body;
 use actix_http::cookie::{Cookie, CookieJar, USERINFO};
 use actix_http::http::header::{self, Header, IntoHeaderValue};
 use actix_http::http::{
-    uri, ConnectionType, Error as HttpError, HeaderMap, HeaderName, HeaderValue,
-    HttpTryFrom, Method, Uri, Version,
+    uri, ConnectionType, Error as HttpError, HeaderMap, HeaderName, HeaderValue, Method,
+    Uri, Version,
 };
 use actix_http::{Error, RequestHead};
 
@@ -23,13 +23,10 @@ use crate::frozen::FrozenClientRequest;
 use crate::sender::{PrepForSendingError, RequestSender, SendClientRequest};
 use crate::ClientConfig;
 
-#[cfg(any(feature = "brotli", feature = "flate2-zlib", feature = "flate2-rust"))]
+#[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
 const HTTPS_ENCODING: &str = "br, gzip, deflate";
-#[cfg(all(
-    any(feature = "flate2-zlib", feature = "flate2-rust"),
-    not(feature = "brotli")
-))]
-const HTTPS_ENCODING: &str = "gzip, deflate";
+#[cfg(not(any(feature = "flate2-zlib", feature = "flate2-rust")))]
+const HTTPS_ENCODING: &str = "br";
 
 /// An HTTP Client request builder
 ///
@@ -37,21 +34,20 @@ const HTTPS_ENCODING: &str = "gzip, deflate";
 /// builder-like pattern.
 ///
 /// ```rust
-/// use futures::future::{Future, lazy};
 /// use actix_rt::System;
 ///
-/// fn main() {
-///     System::new("test").block_on(lazy(|| {
-///        awc::Client::new()
-///           .get("http://www.rust-lang.org") // <- Create request builder
-///           .header("User-Agent", "Actix-web")
-///           .send()                          // <- Send http request
-///           .map_err(|_| ())
-///           .and_then(|response| {           // <- server http response
-///                println!("Response: {:?}", response);
-///                Ok(())
-///           })
-///     }));
+/// #[actix_rt::main]
+/// async fn main() {
+///    let response = awc::Client::new()
+///         .get("http://www.rust-lang.org") // <- Create request builder
+///         .header("User-Agent", "Actix-web")
+///         .send()                          // <- Send http request
+///         .await;
+///
+///    response.and_then(|response| {   // <- server http response
+///         println!("Response: {:?}", response);
+///         Ok(())
+///    });
 /// }
 /// ```
 pub struct ClientRequest {
@@ -68,7 +64,8 @@ impl ClientRequest {
     /// Create new client request builder.
     pub(crate) fn new<U>(method: Method, uri: U, config: Rc<ClientConfig>) -> Self
     where
-        Uri: HttpTryFrom<U>,
+        Uri: TryFrom<U>,
+        <Uri as TryFrom<U>>::Error: Into<HttpError>,
     {
         ClientRequest {
             config,
@@ -87,7 +84,8 @@ impl ClientRequest {
     #[inline]
     pub fn uri<U>(mut self, uri: U) -> Self
     where
-        Uri: HttpTryFrom<U>,
+        Uri: TryFrom<U>,
+        <Uri as TryFrom<U>>::Error: Into<HttpError>,
     {
         match Uri::try_from(uri) {
             Ok(uri) => self.head.uri = uri,
@@ -158,7 +156,7 @@ impl ClientRequest {
     ///
     /// ```rust
     /// fn main() {
-    /// # actix_rt::System::new("test").block_on(futures::future::lazy(|| {
+    /// # actix_rt::System::new("test").block_on(futures::future::lazy(|_| {
     ///     let req = awc::Client::new()
     ///         .get("http://www.rust-lang.org")
     ///         .set(awc::http::header::Date::now())
@@ -186,18 +184,19 @@ impl ClientRequest {
     /// use awc::{http, Client};
     ///
     /// fn main() {
-    /// # actix_rt::System::new("test").block_on(futures::future::lazy(|| {
+    /// # actix_rt::System::new("test").block_on(async {
     ///     let req = Client::new()
     ///         .get("http://www.rust-lang.org")
     ///         .header("X-TEST", "value")
     ///         .header(http::header::CONTENT_TYPE, "application/json");
     /// #   Ok::<_, ()>(())
-    /// # }));
+    /// # });
     /// }
     /// ```
     pub fn header<K, V>(mut self, key: K, value: V) -> Self
     where
-        HeaderName: HttpTryFrom<K>,
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
         V: IntoHeaderValue,
     {
         match HeaderName::try_from(key) {
@@ -213,7 +212,8 @@ impl ClientRequest {
     /// Insert a header, replaces existing header.
     pub fn set_header<K, V>(mut self, key: K, value: V) -> Self
     where
-        HeaderName: HttpTryFrom<K>,
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
         V: IntoHeaderValue,
     {
         match HeaderName::try_from(key) {
@@ -229,7 +229,8 @@ impl ClientRequest {
     /// Insert a header only if it is not yet set.
     pub fn set_header_if_none<K, V>(mut self, key: K, value: V) -> Self
     where
-        HeaderName: HttpTryFrom<K>,
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
         V: IntoHeaderValue,
     {
         match HeaderName::try_from(key) {
@@ -265,7 +266,8 @@ impl ClientRequest {
     #[inline]
     pub fn content_type<V>(mut self, value: V) -> Self
     where
-        HeaderValue: HttpTryFrom<V>,
+        HeaderValue: TryFrom<V>,
+        <HeaderValue as TryFrom<V>>::Error: Into<HttpError>,
     {
         match HeaderValue::try_from(value) {
             Ok(value) => self.head.headers.insert(header::CONTENT_TYPE, value),
@@ -277,9 +279,7 @@ impl ClientRequest {
     /// Set content length
     #[inline]
     pub fn content_length(self, len: u64) -> Self {
-        let mut wrt = BytesMut::new().writer();
-        let _ = write!(wrt, "{}", len);
-        self.header(header::CONTENT_LENGTH, wrt.get_mut().take().freeze())
+        self.header(header::CONTENT_LENGTH, len)
     }
 
     /// Set HTTP basic authorization header
@@ -308,26 +308,21 @@ impl ClientRequest {
     /// Set a cookie
     ///
     /// ```rust
-    /// # use actix_rt::System;
-    /// # use futures::future::{lazy, Future};
-    /// fn main() {
-    ///     System::new("test").block_on(lazy(|| {
-    ///         awc::Client::new().get("https://www.rust-lang.org")
-    ///             .cookie(
-    ///                 awc::http::Cookie::build("name", "value")
-    ///                     .domain("www.rust-lang.org")
-    ///                     .path("/")
-    ///                     .secure(true)
-    ///                     .http_only(true)
-    ///                     .finish(),
-    ///             )
-    ///             .send()
-    ///             .map_err(|_| ())
-    ///             .and_then(|response| {
-    ///                println!("Response: {:?}", response);
-    ///                Ok(())
-    ///             })
-    ///     }));
+    /// #[actix_rt::main]
+    /// async fn main() {
+    ///     let resp = awc::Client::new().get("https://www.rust-lang.org")
+    ///         .cookie(
+    ///             awc::http::Cookie::build("name", "value")
+    ///                 .domain("www.rust-lang.org")
+    ///                 .path("/")
+    ///                 .secure(true)
+    ///                 .http_only(true)
+    ///                 .finish(),
+    ///          )
+    ///          .send()
+    ///          .await;
+    ///
+    ///     println!("Response: {:?}", resp);
     /// }
     /// ```
     pub fn cookie(mut self, cookie: Cookie<'_>) -> Self {
@@ -478,7 +473,7 @@ impl ClientRequest {
     /// Set an streaming body and generate `ClientRequest`.
     pub fn send_stream<S, E>(self, stream: S) -> SendClientRequest
     where
-        S: Stream<Item = Bytes, Error = E> + 'static,
+        S: Stream<Item = Result<Bytes, E>> + Unpin + 'static,
         E: Into<Error> + 'static,
     {
         let slf = match self.prep_for_sending() {
@@ -519,9 +514,9 @@ impl ClientRequest {
         let uri = &self.head.uri;
         if uri.host().is_none() {
             return Err(InvalidUrl::MissingHost.into());
-        } else if uri.scheme_part().is_none() {
+        } else if uri.scheme().is_none() {
             return Err(InvalidUrl::MissingScheme.into());
-        } else if let Some(scheme) = uri.scheme_part() {
+        } else if let Some(scheme) = uri.scheme() {
             match scheme.as_str() {
                 "http" | "ws" | "https" | "wss" => (),
                 _ => return Err(InvalidUrl::UnknownScheme.into()),
@@ -546,31 +541,23 @@ impl ClientRequest {
 
         let mut slf = self;
 
-        // enable br only for https
-        #[cfg(any(
-            feature = "brotli",
-            feature = "flate2-zlib",
-            feature = "flate2-rust"
-        ))]
-        {
-            if slf.response_decompress {
-                let https = slf
-                    .head
-                    .uri
-                    .scheme_part()
-                    .map(|s| s == &uri::Scheme::HTTPS)
-                    .unwrap_or(true);
+        if slf.response_decompress {
+            let https = slf
+                .head
+                .uri
+                .scheme()
+                .map(|s| s == &uri::Scheme::HTTPS)
+                .unwrap_or(true);
 
-                if https {
-                    slf = slf.set_header_if_none(header::ACCEPT_ENCODING, HTTPS_ENCODING)
-                } else {
-                    #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
-                    {
-                        slf = slf
-                            .set_header_if_none(header::ACCEPT_ENCODING, "gzip, deflate")
-                    }
-                };
-            }
+            if https {
+                slf = slf.set_header_if_none(header::ACCEPT_ENCODING, HTTPS_ENCODING)
+            } else {
+                #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
+                {
+                    slf =
+                        slf.set_header_if_none(header::ACCEPT_ENCODING, "gzip, deflate")
+                }
+            };
         }
 
         Ok(slf)
@@ -578,7 +565,7 @@ impl ClientRequest {
 }
 
 impl fmt::Debug for ClientRequest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
             "\nClientRequest {:?} {}:{}",

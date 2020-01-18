@@ -1,5 +1,17 @@
 # Changes
 
+## [2.0.0] - 2019-12-20
+
+* Release
+
+## [2.0.0-alpha.1] - 2019-12-15
+
+* Migrate to actix-web 2.0.0
+
+## [1.0.4] - 2019-12-07
+
+* Allow comma-separated websocket subprotocols without spaces (#1172)
+
 ## [1.0.3] - 2019-11-14
 
 * Update actix-web and actix-http dependencies

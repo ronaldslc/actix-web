@@ -1,5 +1,17 @@
 # Changes
 
+## [0.2.0] - 2019-12-20
+
+* Release
+
+## [0.2.0-alpha.4] - 2019-12-xx
+
+* Multipart handling now handles Pending during read of boundary #1205
+
+## [0.2.0-alpha.2] - 2019-12-03
+
+* Migrate to `std::future`
+
 ## [0.1.4] - 2019-09-12
 
 * Multipart handling now parses requests which do not end in CRLF #1038

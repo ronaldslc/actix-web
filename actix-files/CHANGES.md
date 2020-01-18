@@ -1,5 +1,17 @@
 # Changes
 
+## [0.2.1] - 2019-12-22
+
+* Use the same format for file URLs regardless of platforms
+
+## [0.2.0] - 2019-12-20
+
+* Fix BodyEncoding trait import #1220
+
+## [0.2.0-alpha.1] - 2019-12-07
+
+* Migrate to `std::future`
+
 ## [0.1.7] - 2019-11-06
 
 * Add an additional `filename*` param in the `Content-Disposition` header of `actix_files::NamedFile` to be more compatible. (#1151)

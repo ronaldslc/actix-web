@@ -462,12 +462,12 @@ impl ContentDisposition {
 }
 
 impl IntoHeaderValue for ContentDisposition {
-    type Error = header::InvalidHeaderValueBytes;
+    type Error = header::InvalidHeaderValue;
 
     fn try_into(self) -> Result<header::HeaderValue, Self::Error> {
         let mut writer = Writer::new();
         let _ = write!(&mut writer, "{}", self);
-        header::HeaderValue::from_shared(writer.take())
+        header::HeaderValue::from_maybe_shared(writer.take())
     }
 }
 
@@ -486,7 +486,7 @@ impl Header for ContentDisposition {
 }
 
 impl fmt::Display for DispositionType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DispositionType::Inline => write!(f, "inline"),
             DispositionType::Attachment => write!(f, "attachment"),
@@ -497,7 +497,7 @@ impl fmt::Display for DispositionType {
 }
 
 impl fmt::Display for DispositionParam {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // All ASCII control characters (0-30, 127) including horizontal tab, double quote, and
         // backslash should be escaped in quoted-string (i.e. "foobar").
         // Ref: RFC6266 S4.1 -> RFC2616 S3.6
@@ -555,7 +555,7 @@ impl fmt::Display for DispositionParam {
 }
 
 impl fmt::Display for ContentDisposition {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.disposition)?;
         self.parameters
             .iter()
@@ -768,9 +768,8 @@ mod tests {
         Mainstream browsers like Firefox (gecko) and Chrome use UTF-8 directly as above.
         (And now, only UTF-8 is handled by this implementation.)
         */
-        let a =
-            HeaderValue::from_str("form-data; name=upload; filename=\"文件.webp\"")
-                .unwrap();
+        let a = HeaderValue::from_str("form-data; name=upload; filename=\"文件.webp\"")
+            .unwrap();
         let a: ContentDisposition = ContentDisposition::from_raw(&a).unwrap();
         let b = ContentDisposition {
             disposition: DispositionType::FormData,
@@ -884,7 +883,11 @@ mod tests {
         assert!(ContentDisposition::from_raw(&a).is_err());
 
         let a = HeaderValue::from_static("inline; filename=\"\"");
-        assert!(ContentDisposition::from_raw(&a).expect("parse cd").get_filename().expect("filename").is_empty());
+        assert!(ContentDisposition::from_raw(&a)
+            .expect("parse cd")
+            .get_filename()
+            .expect("filename")
+            .is_empty());
     }
 
     #[test]

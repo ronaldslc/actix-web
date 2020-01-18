@@ -1,6 +1,9 @@
 //! Middlewares
+
+#[cfg(feature = "compress")]
 mod compress;
-pub use self::compress::{BodyEncoding, Compress};
+#[cfg(feature = "compress")]
+pub use self::compress::Compress;
 
 mod condition;
 mod defaultheaders;

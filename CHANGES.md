@@ -1,5 +1,74 @@
 # Changes
 
+## [2.0.NEXT] - 2020-01-xx
+
+### Changed
+
+*  Use `sha-1` crate instead of unmaintained `sha1` crate
+
+## [2.0.0] - 2019-12-25
+
+### Changed
+
+* Rename `HttpServer::start()` to `HttpServer::run()`
+
+* Allow to gracefully stop test server via `TestServer::stop()`
+
+* Allow to specify multi-patterns for resources
+
+## [2.0.0-rc] - 2019-12-20
+
+### Changed
+
+* Move `BodyEncoding` to `dev` module #1220
+
+* Allow to set `peer_addr` for TestRequest #1074
+
+* Make web::Data deref to Arc<T> #1214
+
+* Rename `App::register_data()` to `App::app_data()`
+
+* `HttpRequest::app_data<T>()` returns `Option<&T>` instead of `Option<&Data<T>>`
+
+### Fixed
+
+* Fix `AppConfig::secure()` is always false. #1202
+
+
+## [2.0.0-alpha.6] - 2019-12-15
+
+### Fixed
+
+* Fixed compilation with default features off
+
+## [2.0.0-alpha.5] - 2019-12-13
+
+### Added
+
+* Add test server, `test::start()` and `test::start_with()`
+
+## [2.0.0-alpha.4] - 2019-12-08
+
+### Deleted
+
+* Delete HttpServer::run(), it is not useful witht async/await
+
+## [2.0.0-alpha.3] - 2019-12-07
+
+### Changed
+
+* Migrate to tokio 0.2
+
+
+## [2.0.0-alpha.1] - 2019-11-22
+
+### Changed
+
+* Migrated to `std::future`
+
+* Remove implementation of `Responder` for `()`. (#1167)
+
+
 ## [1.0.9] - 2019-11-14
 
 ### Added
